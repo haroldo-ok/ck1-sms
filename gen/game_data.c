@@ -26,8 +26,8 @@ const unsigned char font_1bpp[472] = {
 const unsigned char item_score_hi[11]={0,0,1,3,19,0,0,1,1,1,1};
 const unsigned char item_score_lo[11]={100,200,244,232,136,0,0,244,244,244,244};
 const LevelDesc level_descs[4] = {
-  { lvl0_tiles,11072, lvl0_mtdef,lvl0_mtflags,lvl0_map, lvl0_items,0, lvl0_yorps,0, lvl0_entries,3, 7,8,71,69,123, 160,560, 0,0,0,0 },
-  { lvl1_tiles,4480, lvl1_mtdef,lvl1_mtflags,lvl1_map, lvl1_items,25, lvl1_yorps,8, lvl1_entries,0, 4,4,116,17,55, 16,208, 111,6,2,2 },
-  { lvl2_tiles,1312, lvl2_mtdef,lvl2_mtflags,lvl2_map, lvl2_items,0, lvl2_yorps,0, lvl2_entries,0, 5,5,20,26,19, 32,336, 15,3,2,2 },
-  { lvl3_tiles,3584, lvl3_mtdef,lvl3_mtflags,lvl3_map, lvl3_items,0, lvl3_yorps,2, lvl3_entries,0, 6,6,77,49,45, 32,720, 71,8,2,2 },
+  { lvl0_tiles,11072, lvl0_mtdef,lvl0_mtflags,lvl0_map, lvl0_items,0, lvl0_yorps,0, lvl0_entries,3, lvl0_blocks,2, 7,8,71,69,123, 160,560, 0,0,0,0 },
+  { lvl1_tiles,4480, lvl1_mtdef,lvl1_mtflags,lvl1_map, lvl1_items,25, lvl1_yorps,8, lvl1_entries,0, lvl1_blocks,0, 4,4,116,17,55, 16,208, 111,6,2,2 },
+  { lvl2_tiles,1312, lvl2_mtdef,lvl2_mtflags,lvl2_map, lvl2_items,0, lvl2_yorps,0, lvl2_entries,0, lvl2_blocks,0, 5,5,20,26,19, 32,336, 15,3,2,2 },
+  { lvl3_tiles,3584, lvl3_mtdef,lvl3_mtflags,lvl3_map, lvl3_items,0, lvl3_yorps,2, lvl3_entries,0, lvl3_blocks,0, 6,6,77,49,45, 32,720, 71,8,2,2 },
 };

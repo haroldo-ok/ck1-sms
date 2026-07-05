@@ -251,3 +251,4 @@ const unsigned char lvl0_items[1] = {
 0,};
 const unsigned int lvl0_yorps[1] = {0};
 const unsigned char lvl0_entries[15] = {19,37,2,2,1,22,28,1,1,2,9,21,2,2,3};
+const unsigned char lvl0_blocks[6] = {20,37,1,20,38,1};
