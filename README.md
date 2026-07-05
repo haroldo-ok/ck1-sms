@@ -20,7 +20,11 @@ original JS version: title screen → Mars overworld → three platform levels
 
 Collect the pogo stick / keycards in the levels, bounce on a yorp's head to
 stun it, shoot it to stop it for good. Walk into the exit door to clear a
-level; clear all three to win.
+level; clear all three to win. The rock gate east of the first city opens
+once level 1 is beaten, unlocking the rest of the map (the `level-block`
+object from the original's TMX data — its collision handling was commented
+out in the JS, which made the blocker decorative; here it works as the
+classic Keen progression gate).
 
 ## Building
 
@@ -113,3 +117,9 @@ bank 8      overworld map + objects (split: >16 KB together)
 * `tools/nttest.py` — roams level 1 and validates every visible name-table
   cell against the map+metatile data (~80 k cell comparisons), proving the
   ring-buffer scroll engine writes exactly the right tiles.
+* `tools/owtest.py` — walks laps around the Mars map asserting scroll
+  registers and all visible name-table cells match the camera derived
+  from the player position.
+* `tools/gatetest.py` — verifies the level-1 gate blocks until the level
+  is beaten, opens afterwards, and that level 2 is then reachable and
+  enterable.

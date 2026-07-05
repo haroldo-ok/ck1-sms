@@ -334,3 +334,4 @@ const unsigned char lvl3_items[1] = {
 0,};
 const unsigned int lvl3_yorps[4] = {288,696,256,728};
 const unsigned char lvl3_entries[1] = {0};
+const unsigned char lvl3_blocks[1] = {0};

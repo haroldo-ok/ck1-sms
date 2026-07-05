@@ -284,7 +284,7 @@ def build_level(cfg):
         lb.map[i] = art_cache[key]
 
     # -------- objects
-    items, yorps, entries = [], [], []
+    items, yorps, entries, blocks_raw = [], [], [], []
     spawn = (16,16); exit_rect=(0,0,0,0)
     def cellxy(o): return o['x']//16, o['y']//16
 
@@ -323,21 +323,35 @@ def build_level(cfg):
             if ln in ('1','2','3'):
                 entries.append((mx,my,max(1,o['w']//16),max(1,o['h']//16),int(ln)))
         elif n == 'level-block':
+            cells = []
             for dy in range(max(1,o['h']//16)):
                 for dx in range(max(1,o['w']//16)):
                     ii=(my+dy)*W+(mx+dx)
                     key = lb.mts[lb.map[ii]]
+                    if not (key[4] & F_SOLID): cells.append((mx+dx, my+dy))
                     lb.map[ii] = lb.add_mt_from_key(key) if False else lb.mt_idx.setdefault(
                         key[:4]+(key[4]|F_SOLID,),
                         lb._dup(key[:4], key[4]|F_SOLID))
+            if cells:
+                blocks_raw.append((cells,
+                                   o['x'] + o['w']/2.0, o['y'] + o['h']/2.0))
     limit = 384 if cfg['id']==0 else 256
     if len(lb.tiles) > limit:
         raise SystemExit('%s: %d subtiles (>%d)' % (lb.name, len(lb.tiles), limit))
     if len(lb.mts) > 255:
         raise SystemExit('%s: %d metatiles (>255)' % (lb.name, len(lb.mts)))
-    print('%-8s %3dx%-3d subtiles=%3d metatiles=%3d items=%2d yorps=%d entries=%d'
-          % (lb.name, W,H, len(lb.tiles), len(lb.mts), len(items), len(yorps), len(entries)))
-    return dict(lb=lb, items=items, yorps=yorps, entries=entries,
+    blocks = []
+    for cells, bx, by in blocks_raw:
+        best, bd = None, None
+        for (emx,emy,ew,eh,elvl) in entries:
+            ex, ey = (emx + ew/2.0)*16, (emy + eh/2.0)*16
+            d = (ex-bx)*(ex-bx) + (ey-by)*(ey-by)
+            if bd is None or d < bd: bd, best = d, elvl
+        if best is not None:
+            blocks += [(cx, cy, best) for (cx, cy) in cells]
+    print('%-8s %3dx%-3d subtiles=%3d metatiles=%3d items=%2d yorps=%d entries=%d blocks=%d'
+          % (lb.name, W,H, len(lb.tiles), len(lb.mts), len(items), len(yorps), len(entries), len(blocks)))
+    return dict(lb=lb, items=items, yorps=yorps, entries=entries, blocks=blocks,
                 spawn=spawn, exit=exit_rect, cfg=cfg)
 
 def _dup(self, t4, flags):
@@ -456,9 +470,14 @@ def emit_level_bank(bank, b, map_bank=None):
         f.write('const unsigned char %s_entries[%d] = {' % (p, max(1,len(entries)*5)))
         f.write(','.join('%d,%d,%d,%d,%d'%(e) for e in entries) or '0')
         f.write('};\n')
+        blocks = b['blocks']
+        f.write('const unsigned char %s_blocks[%d] = {' % (p, max(1,len(blocks)*3)))
+        f.write(','.join('%d,%d,%d'%(e) for e in blocks) or '0')
+        f.write('};\n')
     return dict(prefix=p, bank=bank, map_bank=map_bank, ntiles=len(lb.tiles), nmt=len(lb.mts),
                 W=lb.W, H=lb.H, nitems=len(items), nyorps=len(yorps),
-                nentries=len(entries), spawn=b['spawn'], exit=b['exit'])
+                nentries=len(entries), nblocks=len(blocks),
+                spawn=b['spawn'], exit=b['exit'])
 
 descs = []
 order = {1:4, 2:5, 3:6, 0:7}
@@ -501,6 +520,7 @@ typedef struct {
   const unsigned char *items;   unsigned char nitems;
   const unsigned int  *yorps;   unsigned char nyorps;
   const unsigned char *entries; unsigned char nentries;
+  const unsigned char *blocks;  unsigned char nblocks;
   unsigned char bank, map_bank, W, H, nmt;
   unsigned int  spawn_x, spawn_y;
   unsigned char exit_mx, exit_my, exit_mw, exit_mh;
@@ -513,8 +533,8 @@ extern const unsigned char item_score_hi[11], item_score_lo[11];
 ''')
     for dsc in descs:
         p=dsc['prefix']
-        f.write('extern const unsigned char %s_tiles[],%s_mtflags[],%s_map[],%s_items[],%s_entries[];\n'
-                % (p,p,p,p,p))
+        f.write('extern const unsigned char %s_tiles[],%s_mtflags[],%s_map[],%s_items[],%s_entries[],%s_blocks[];\n'
+                % (p,p,p,p,p,p))
         f.write('extern const unsigned int %s_mtdef[];\n' % p)
         f.write('extern const unsigned int %s_yorps[];\n' % p)
     f.write('extern const unsigned char spr_keen[],spr_yorp[],spr_owk[],spr_blt[];\n')
@@ -534,8 +554,9 @@ with open(os.path.join(GEN,'game_data.c'),'w') as f:
     for lid in (0,1,2,3):
         dsc = by_id[lid]; p = dsc['prefix']
         ex = dsc['exit']
-        f.write('  { %s_tiles,%d, %s_mtdef,%s_mtflags,%s_map, %s_items,%d, %s_yorps,%d, %s_entries,%d, %d,%d,%d,%d,%d, %d,%d, %d,%d,%d,%d },\n'
+        f.write('  { %s_tiles,%d, %s_mtdef,%s_mtflags,%s_map, %s_items,%d, %s_yorps,%d, %s_entries,%d, %s_blocks,%d, %d,%d,%d,%d,%d, %d,%d, %d,%d,%d,%d },\n'
           % (p, dsc['ntiles']*32, p,p,p, p,dsc['nitems'], p,dsc['nyorps'], p,dsc['nentries'],
+             p,dsc['nblocks'],
              dsc['bank'], dsc['map_bank'], dsc['W'], dsc['H'], dsc['nmt'],
              dsc['spawn'][0], dsc['spawn'][1], ex[0],ex[1],ex[2],ex[3]))
     f.write('};\n')

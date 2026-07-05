@@ -95,3 +95,4 @@ const unsigned char lvl2_items[1] = {
 0,};
 const unsigned int lvl2_yorps[1] = {0};
 const unsigned char lvl2_entries[1] = {0};
+const unsigned char lvl2_blocks[1] = {0};

@@ -144,6 +144,11 @@ static unsigned char rng;
 static unsigned char scroll_y;          /* cam_y % 224, kept incrementally */
 static unsigned char anim_ph;           /* walk anim phase 0..2 */
 
+/* overworld gates: solid cells that open once their level is beaten */
+#define MAX_BLK 8
+static unsigned char blk_mx[MAX_BLK], blk_my[MAX_BLK], blk_lvl[MAX_BLK];
+static unsigned char n_blk;
+
 /* loop-side input edge detection: immune to ISR updates mid-frame
    (SMS_getKeysPressed loses edges whenever a game frame overruns and the
    ISR refreshes its previous/current pair before the loop reads it) */
@@ -433,6 +438,12 @@ static void load_level(unsigned char lvl) {
     /* scroll_y recomputed by callers after camera setup via set_scroll_y_full */
 
     n_ovr = 0;
+    n_blk = ld->nblocks;
+    if (n_blk > MAX_BLK) n_blk = MAX_BLK;
+    p = ld->blocks;
+    for (i = 0; i < n_blk; i++) {
+        blk_mx[i] = *p++; blk_my[i] = *p++; blk_lvl[i] = *p++;
+    }
     n_items = ld->nitems;
     p = ld->items;
     for (i = 0; i < n_items; i++) {
@@ -1007,10 +1018,22 @@ static void build_sprites_ow(void) {
     SMS_addSpriteClipping(sx + 8, sy + 8, (unsigned char)(VT_OWKEEN - 256 + 3));
 }
 
+/* a solid probe point is forgiven if its cell is a gate whose level is done */
+static unsigned char ow_solid_at(int x, int y) {
+    unsigned char i, cx, cy;
+    if (!(mflag(x, y) & F_SOLID)) return 0;
+    cx = (unsigned char)((unsigned int)x >> 4);
+    cy = (unsigned char)((unsigned int)y >> 4);
+    for (i = 0; i < n_blk; i++)
+        if (blk_mx[i] == cx && blk_my[i] == cy && level_done[blk_lvl[i]])
+            return 0;                            /* gate is open */
+    return 1;
+}
+
 static unsigned char ow_blocked(int nx, int ny) {
     /* 12x14 box inside the 16x16 frame */
-    return ((mflag(nx + 2,  ny + 2)  | mflag(nx + 13, ny + 2) |
-             mflag(nx + 2,  ny + 15) | mflag(nx + 13, ny + 15)) & F_SOLID) ? 1 : 0;
+    return (ow_solid_at(nx + 2,  ny + 2)  || ow_solid_at(nx + 13, ny + 2) ||
+            ow_solid_at(nx + 2,  ny + 15) || ow_solid_at(nx + 13, ny + 15)) ? 1 : 0;
 }
 
 static void run_overworld(void) {
