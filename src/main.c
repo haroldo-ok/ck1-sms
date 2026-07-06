@@ -31,12 +31,16 @@ __sfr __at 0x7F PSGPort;
 #define STATE_TITLE  0
 #define STATE_OW     1
 #define STATE_LEVEL  2
+#define STATE_WIN    3
 
 /* VRAM sprite tile slots (absolute tile numbers; pass n-256 to addSprite) */
 #define VT_PLAYER   256            /* 6 tiles, streamed every frame          */
-#define VT_YORP0    262            /* 3 x 6 tiles, streamed on frame change  */
-#define VT_BULLET   280            /* 12 tiles, loaded once per level        */
-#define VT_OWKEEN   440            /* 4 tiles, overworld player (BG<=384)    */
+#define VT_SLOT0    262            /* 8 x 6 tiles, entity streaming slots    */
+#define VT_BULLET   312            /* 12 tiles, loaded once per level        */
+#define VT_ERAY     324            /* 2 tiles, enemy ray                     */
+#define VT_CHUNK    326            /* 4 tiles, ice chunk                     */
+#define VT_OWKEEN   444            /* 4 tiles, overworld player              */
+#define N_SLOTS     8
 
 /* physics, 8.8 fixed point (units: 1/256 px per frame) */
 #define WALK_ACC     96
@@ -48,8 +52,30 @@ __sfr __at 0x7F PSGPort;
 #define POGO_STEER   77
 #define BULLET_V    640
 
-#define MAX_YORPS    8
-#define MAX_OVR     32
+#define MAX_ENT     30
+#define MAX_OVR    200
+#define MAX_DOORS    8
+#define MAX_ENTRIES 48
+#define MAX_EXITS    4
+#define NLEVELS     17
+
+/* item kinds (must match tools/convert_ck1.py) */
+#define K_PTS100  0
+#define K_PTS5000 4                     /* kinds 0..4 = points */
+#define K_AMMO    5
+#define K_POGO    6
+#define K_CARDY   7                     /* 7..10 = keycards Y R G B */
+#define K_CARDB  10
+#define K_JOYSTICK 11                   /* 11..14 = ship parts */
+#define K_FUEL   14
+
+/* entity types (converter codes minus one) */
+#define ET_YORP   0
+#define ET_GARG   1
+#define ET_VORT   2
+#define ET_BUTLER 3
+#define ET_TANK   4
+#define ET_CANNON0 5                    /* 5..8: vectors (1,-1)(0,-1)(0,1)(-1,-1) */
 
 /* keen sprite-sheet frame ids (16x24 frames, 6 per row) */
 #define KF_STAND_R  0
@@ -79,13 +105,15 @@ __sfr __at 0x7F PSGPort;
 static const LevelDesc *ld;
 unsigned char cur_level;                /* 0=overworld 1..3 */
 unsigned char game_state;
-unsigned char level_done[4];
+unsigned char level_done[NLEVELS];
 static unsigned int  score_hi;          /* score = hi*10000 + lo (BCD-ish)   */
 static unsigned int  score_lo;
 
-/* inventory (persists across levels like the JS original) */
+/* inventory */
 static unsigned char inv_ammo, inv_pogo;
-static unsigned char inv_keys;          /* bit 0..3 = keycards A..D          */
+static unsigned char inv_keys;          /* bit 0..3 = card Y R G B, per level */
+unsigned char inv_parts;                /* bit 0..3 = joystick/battery/vacuum/fuel */
+static unsigned char stun_t;            /* icy-chunk stun timer */
 
 /* map access (valid while ld->map_bank mapped) */
 static const unsigned char *map_rom;
@@ -103,9 +131,19 @@ static unsigned char it_mx[MAX_OVR], it_my[MAX_OVR], it_kind[MAX_OVR],
                      it_restore[MAX_OVR], it_taken[MAX_OVR];
 static unsigned char n_items;
 
-/* overworld entries */
-static unsigned char en_mx[8], en_my[8], en_mw[8], en_mh[8], en_lvl[8];
+/* overworld entries (one per city cell) */
+static unsigned char en_mx[MAX_ENTRIES], en_my[MAX_ENTRIES],
+                     en_lvl[MAX_ENTRIES], en_done[MAX_ENTRIES];
 static unsigned char n_entries;
+
+/* doors (per level): color 0..3 = Y R G B */
+static unsigned char do_mx[MAX_DOORS], do_my[MAX_DOORS], do_col[MAX_DOORS],
+                     do_restore[MAX_DOORS], do_open[MAX_DOORS];
+static unsigned char n_doors;
+
+/* exit cells */
+static unsigned char ex_mx[MAX_EXITS], ex_my[MAX_EXITS];
+static unsigned char n_exits;
 
 /* camera */
 static unsigned int cam_x, cam_y;
@@ -127,27 +165,30 @@ static unsigned char fall_snd_on;
 static unsigned char b_active, b_hit, b_timer, b_right;
 static int b_px, b_py;
 
-/* yorps */
+/* entities */
 static unsigned char y_n;
-static int  y_px[MAX_YORPS], y_py[MAX_YORPS];
-static int  y_vx[MAX_YORPS], y_vy[MAX_YORPS];
-static int  y_sx[MAX_YORPS], y_sy[MAX_YORPS];
-static unsigned char  y_state[MAX_YORPS];   /* 0 alive 1 stunned 2 dying 3 dead */
-static unsigned int   y_t[MAX_YORPS];
-static unsigned char  y_hop[MAX_YORPS];
-static unsigned char  y_frame[MAX_YORPS];
-static unsigned char  y_slot[MAX_YORPS];    /* 0..2 or 0xFF */
-static unsigned char  slot_owner[3];        /* yorp idx or 0xFF */
-static unsigned char  slot_vframe[3];       /* frame resident in VRAM (0xFE=none) */
+static unsigned char e_type[MAX_ENT];
+static int  y_px[MAX_ENT], y_py[MAX_ENT];
+static int  y_vx[MAX_ENT], y_vy[MAX_ENT];
+static int  y_sx[MAX_ENT], y_sy[MAX_ENT];
+static unsigned char  y_state[MAX_ENT];   /* 0 alive 1 stunned 2 dying 3 dead */
+static unsigned int   y_t[MAX_ENT];
+static unsigned char  y_hop[MAX_ENT];
+static unsigned char  y_hp[MAX_ENT];
+static unsigned char  y_frame[MAX_ENT];   /* (type<<4)|frame key for streaming */
+static unsigned char  y_slot[MAX_ENT];    /* 0..N_SLOTS-1 or 0xFF */
+static unsigned char  slot_owner[N_SLOTS];
+static unsigned char  slot_vframe[N_SLOTS];
+
+/* projectiles: 2 ice chunks + 2 enemy rays */
+static unsigned char pj_on[4];            /* 0 off, 1 chunk, 2 eray */
+static int pj_x[4], pj_y[4], pj_vx[4], pj_vy[4];
 
 static unsigned char rng;
 static unsigned char scroll_y;          /* cam_y % 224, kept incrementally */
 static unsigned char anim_ph;           /* walk anim phase 0..2 */
 
-/* overworld gates: solid cells that open once their level is beaten */
-#define MAX_BLK 8
-static unsigned char blk_mx[MAX_BLK], blk_my[MAX_BLK], blk_lvl[MAX_BLK];
-static unsigned char n_blk;
+
 
 /* loop-side input edge detection: immune to ISR updates mid-frame
    (SMS_getKeysPressed loses edges whenever a game frame overruns and the
@@ -245,7 +286,7 @@ static void sfx_update(void) {
 }
 
 /* precomputed my*mapW offsets (mapH <= 69) */
-static unsigned int row_off[72];
+static unsigned int row_off[96];
 
 /* --------------------------------------------------------------- map query - */
 static unsigned char cell_mt(unsigned int mx, unsigned int my) {
@@ -259,6 +300,13 @@ static unsigned char cell_mt(unsigned int mx, unsigned int my) {
 }
 
 /* flags at world pixel; outside map: sides/top solid, bottom open */
+static unsigned char n_open_doors;      /* fast skip when none open */
+static unsigned char door_open_at(unsigned char cx, unsigned char cy) {
+    unsigned char i;
+    for (i = 0; i < n_doors; i++)
+        if (do_open[i] && do_mx[i] == cx && do_my[i] == cy) return 1;
+    return 0;
+}
 static unsigned char mflag(int wx, int wy) {
     unsigned int mx, my;
     if (wx < 0 || wy < 0) return F_SOLID;
@@ -266,7 +314,13 @@ static unsigned char mflag(int wx, int wy) {
     my = (unsigned int)wy >> 4;
     if (mx >= mapW) return F_SOLID;
     if (my >= mapH) return 0;
-    return flags_ram[map_rom[row_off[my] + mx]];
+    {
+        unsigned char f = flags_ram[map_rom[row_off[my] + mx]];
+        if ((f & F_SOLID) && n_open_doors &&
+            door_open_at((unsigned char)mx, (unsigned char)my))
+            return 0;
+        return f;
+    }
 }
 
 /* -------------------------------------------------------------- NT strips -- */
@@ -397,8 +451,10 @@ static void print_num(unsigned char x, unsigned char y, unsigned int hi, unsigne
     for (i = 0; i < 6; i++) { unsigned char c = numbuf[i]; SMS_setTile((unsigned int)(c - 32)); }
 }
 
+static const unsigned int kind_score[15] =
+    { 100, 200, 500, 1000, 5000, 0, 0, 500, 500, 500, 500, 0, 0, 0, 0 };
 static void add_score(unsigned char kind) {
-    score_lo += ((unsigned int)item_score_hi[kind] << 8) + item_score_lo[kind];
+    score_lo += kind_score[kind];
     while (score_lo >= 10000) { score_lo -= 10000; score_hi++; }
 }
 
@@ -428,7 +484,11 @@ static void load_level(unsigned char lvl) {
 
     /* sprite art resident per level */
     SMS_mapROMBank(BANK_SPRITES);
-    if (lvl) SMS_loadTiles(spr_blt, VT_BULLET, 12 * 32);
+    if (lvl) {
+        SMS_loadTiles(spr_blt, VT_BULLET, 12 * 32);
+        SMS_loadTiles(spr_eray, VT_ERAY, 2 * 32);
+        SMS_loadTiles(spr_chunk, VT_CHUNK, 4 * 32);
+    }
 
     /* map-side data */
     SMS_mapROMBank(ld->map_bank);
@@ -438,35 +498,52 @@ static void load_level(unsigned char lvl) {
     /* scroll_y recomputed by callers after camera setup via set_scroll_y_full */
 
     n_ovr = 0;
-    n_blk = ld->nblocks;
-    if (n_blk > MAX_BLK) n_blk = MAX_BLK;
-    p = ld->blocks;
-    for (i = 0; i < n_blk; i++) {
-        blk_mx[i] = *p++; blk_my[i] = *p++; blk_lvl[i] = *p++;
-    }
     n_items = ld->nitems;
     p = ld->items;
     for (i = 0; i < n_items; i++) {
         it_mx[i] = *p++; it_my[i] = *p++; it_kind[i] = *p++; it_restore[i] = *p++;
         it_taken[i] = 0;
     }
-    y_n = ld->nyorps;
-    for (i = 0; i < y_n; i++) {
-        y_px[i] = (int)ld->yorps[i * 2];
-        y_py[i] = (int)ld->yorps[i * 2 + 1];
-        y_vx[i] = y_vy[i] = y_sx[i] = y_sy[i] = 0;
-        y_state[i] = 0; y_t[i] = 0; y_hop[i] = (i * 13) & 31;
-        y_frame[i] = YF_LOOK0; y_slot[i] = 0xFF;
+    n_doors = ld->ndoors;
+    p = ld->doors;
+    for (i = 0; i < n_doors; i++) {
+        do_mx[i] = *p++; do_my[i] = *p++; do_col[i] = *p++; do_restore[i] = *p++;
+        do_open[i] = 0;
     }
-    for (i = 0; i < 3; i++) { slot_owner[i] = 0xFF; slot_vframe[i] = 0xFE; }
+    n_exits = ld->nexits;
+    p = ld->exits;
+    for (i = 0; i < n_exits; i++) { ex_mx[i] = *p++; ex_my[i] = *p++; }
+    y_n = ld->nents;
+    if (y_n > MAX_ENT) y_n = MAX_ENT;
+    p = ld->ents;
+    for (i = 0; i < y_n; i++) {
+        unsigned char t = *p++, emx = *p++, emy = *p++;
+        e_type[i] = t;
+        y_px[i] = (int)emx << 4;
+        y_py[i] = ((int)emy << 4) - (t <= ET_TANK ? 8 : 0);  /* 24px tall */
+        y_vx[i] = y_vy[i] = y_sx[i] = y_sy[i] = 0;
+        y_state[i] = 0; y_t[i] = (i * 37) & 63; y_hop[i] = (i * 13) & 31;
+        y_hp[i] = (t == ET_VORT) ? 4 : 1;
+        y_frame[i] = 0xFD; y_slot[i] = 0xFF;
+        if (t == ET_YORP || t == ET_GARG) y_vx[i] = (i & 1) ? 128 : -128;
+        if (t == ET_BUTLER || t == ET_TANK) y_vx[i] = (i & 1) ? 96 : -96;
+    }
+    for (i = 0; i < N_SLOTS; i++) { slot_owner[i] = 0xFF; slot_vframe[i] = 0xFE; }
+    for (i = 0; i < 4; i++) pj_on[i] = 0;
+    inv_keys = 0; stun_t = 0; n_open_doors = 0;
     n_entries = ld->nentries;
     p = ld->entries;
-    for (i = 0; i < n_entries; i++) {
-        en_mx[i] = *p++; en_my[i] = *p++; en_mw[i] = *p++; en_mh[i] = *p++; en_lvl[i] = *p++;
+    for (i = 0; i < n_entries && i < MAX_ENTRIES; i++) {
+        en_mx[i] = *p++; en_my[i] = *p++; en_lvl[i] = *p++; en_done[i] = *p++;
+        /* completed cities render their "done" art and stop being entries */
+        if (level_done[en_lvl[i]] && n_ovr < MAX_OVR) {
+            ovr_mx[n_ovr] = en_mx[i]; ovr_my[n_ovr] = en_my[i];
+            ovr_mt[n_ovr] = en_done[i]; n_ovr++;
+        }
     }
 
     px = (int)ld->spawn_x; py = (int)ld->spawn_y;
-    if (lvl) py -= 8;                      /* mainPlayer object is 16x32 anchor */
+    if (lvl) py -= 8;                      /* sprite is 16x24, tile anchor */
     vx = vy = sx_acc = sy_acc = 0;
     on_ground = jumping = pogoing = pogo_squat = 0;
     shoot_timer = 0; exiting = 0; dying = 0; seq_timer = 0;
@@ -510,6 +587,13 @@ static void show_status(const char *line1) {
     numbuf[0] = '0' + inv_ammo / 10; numbuf[1] = '0' + inv_ammo % 10; numbuf[2] = 0;
     print_at(16, 12, numbuf);
     if (inv_pogo) print_at(8, 14, "POGO STICK OK");
+    {
+        static char pb[] = "SHIP PARTS 0";
+        unsigned char n = 0, m = inv_parts;
+        while (m) { n += m & 1; m >>= 1; }
+        pb[11] = '0' + n;
+        if (n) print_at(8, 16, pb);
+    }
     SMS_displayOn();
     wait_frames(90);
 }
@@ -616,9 +700,15 @@ static void player_update(unsigned int ks, unsigned int kp) {
         pframe = KF_WALK_R + anim_ph;
         if (seq_timer > 70) {
             level_done[cur_level] = 1;
-            game_state = STATE_OW;
+            game_state = (inv_parts == 0x0F) ? STATE_WIN : STATE_OW;
         }
         return;
+    }
+
+    /* icy-chunk stun: Keen can't act for a moment */
+    if (stun_t) {
+        stun_t--;
+        ks = 0; kp = 0;
     }
 
     /* pogo toggle: DOWN + button 1 */
@@ -724,22 +814,52 @@ static void player_update(unsigned int ks, unsigned int kp) {
             }
             nt_update_cell(it_mx[i], it_my[i]);
             add_score(k);
-            if (k == 5)      { inv_ammo += 5; sfx_play(SFX_KEYCARD); }
-            else if (k == 6) { inv_pogo = 1;  sfx_play(SFX_KEYCARD); }
-            else if (k >= 7) { inv_keys |= 1 << (k - 7); inv_pogo = 1; sfx_play(SFX_KEYCARD); }
+            if (k == K_AMMO)      { inv_ammo += 5; sfx_play(SFX_KEYCARD); }
+            else if (k == K_POGO) { inv_pogo = 1;  sfx_play(SFX_KEYCARD); }
+            else if (k >= K_CARDY && k <= K_CARDB)
+                { inv_keys |= 1 << (k - K_CARDY); sfx_play(SFX_KEYCARD); }
+            else if (k >= K_JOYSTICK)
+                { inv_parts |= 1 << (k - K_JOYSTICK); sfx_play(SFX_EXIT); }
             else sfx_play(SFX_COLLECT);
         }
     }
     }
 
-    /* exit zone */
-    if (ld->exit_mw) {
-        int ex0 = (int)ld->exit_mx << 4, ey0 = (int)ld->exit_my << 4;
-        int ex1 = ex0 + ((int)ld->exit_mw << 4), ey1 = ey0 + ((int)ld->exit_mh << 4) + 14;
-        if (px + 8 >= ex0 && px + 8 < ex1 && py + 23 >= ey0 && py + 23 < ey1 &&
-            on_ground && !pogoing) {
-            exiting = 1; seq_timer = 0;
-            sfx_play(SFX_EXIT);
+    /* exit door cells (tile 159): touch while grounded */
+    if (on_ground && !pogoing) {
+        unsigned char ecx = (unsigned char)((unsigned int)(px + 8) >> 4);
+        unsigned char ecy = (unsigned char)((unsigned int)(py + 12) >> 4);
+        for (i = 0; i < n_exits; i++)
+            if (ex_mx[i] == ecx && (ex_my[i] == ecy || ex_my[i] == ecy + 1)) {
+                exiting = 1; seq_timer = 0;
+                sfx_play(SFX_EXIT);
+                break;
+            }
+    }
+
+    /* locked doors: bump into one holding the matching card to open it */
+    if ((ks & (PORT_A_KEY_LEFT | PORT_A_KEY_RIGHT)) && n_doors) {
+        int probe_x = (ks & PORT_A_KEY_RIGHT) ? (px + 14) : (px + 1);
+        unsigned char dcx = (unsigned char)((unsigned int)probe_x >> 4);
+        unsigned char dcy = (unsigned char)((unsigned int)(py + 12) >> 4);
+        for (i = 0; i < n_doors; i++) {
+            if (do_open[i] || do_mx[i] != dcx) continue;
+            if (do_my[i] != dcy && do_my[i] != dcy - 1 && do_my[i] != dcy + 1)
+                continue;
+            if (inv_keys & (1 << do_col[i])) {
+                unsigned char j, c = do_col[i];
+                for (j = 0; j < n_doors; j++)      /* whole door (all cells) */
+                    if (do_col[j] == c && !do_open[j]) {
+                        do_open[j] = 1; n_open_doors++;
+                        if (n_ovr < MAX_OVR) {
+                            ovr_mx[n_ovr] = do_mx[j]; ovr_my[n_ovr] = do_my[j];
+                            ovr_mt[n_ovr] = do_restore[j]; n_ovr++;
+                        }
+                        nt_update_cell(do_mx[j], do_my[j]);
+                    }
+                sfx_play(SFX_KEYCARD);
+            }
+            break;
         }
     }
 
@@ -778,104 +898,243 @@ static void bullet_update(void) {
         sfx_play(SFX_ZAP);
         return;
     }
-    /* yorps */
+    /* entities */
     for (i = 0; i < y_n; i++) {
-        if (y_state[i] >= 2) continue;
+        if (y_state[i] >= 2 || e_type[i] >= ET_CANNON0) continue;
         if (b_px + 12 >= y_px[i] && b_px + 4 <= y_px[i] + 15 &&
             b_py + 6  >= y_py[i] && b_py + 2 <= y_py[i] + 23) {
-            y_state[i] = 2; y_t[i] = 0;
-            add_score(0);                        /* 100 pts for a yorp */
             b_hit = 1; b_timer = 0;
             sfx_play(SFX_ZAP);
+            if (e_type[i] == ET_TANK || e_type[i] == ET_BUTLER)
+                return;                          /* armored: zap absorbed */
+            if (y_hp[i] > 1) { y_hp[i]--; return; }
+            y_state[i] = 2; y_t[i] = 0;
+            add_score(0);
             return;
         }
     }
 }
 
 /* ----------------------------------------------------------------- yorps --- */
-static void yorp_update(unsigned char i) {
-    int dy, dx;
+/* move entity i with gravity + tile collision (16x24 body, 12px wide box) */
+static void ent_move(unsigned char i, unsigned char gravity) {
+    int d;
     unsigned char f;
-
-    if (y_state[i] == 3) return;                 /* dead: corpse only */
-    /* offscreen cull (like melonJS, which doesn't update offscreen
-       entities): full AI + physics only within ~1.25 screens */
-    dx = y_px[i] - (int)cam_x;
-    if (dx < -80 || dx > 320) {
-        if (y_state[i] == 1 && ++y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
-        return;
+    if (gravity) {
+        y_vy[i] += 20;
+        if (y_vy[i] > 768) y_vy[i] = 768;
     }
-    if (y_state[i] == 2) {                       /* dying */
-        y_frame[i] = YF_DIE;
-        if (++y_t[i] > 12) { y_state[i] = 3; y_frame[i] = YF_DEAD; }
-        return;
-    }
-    if (y_state[i] == 1) {                       /* stunned / crying */
-        y_frame[i] = YF_CRY0 + ((y_t[i] >> 3) & 1);
-        if (++y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
-        return;
-    }
-
-    /* alive: hop periodically */
-    if (++y_hop[i] > 40) {
-        unsigned char g = (mflag(y_px[i] + 4, y_py[i] + 24) |
-                           mflag(y_px[i] + 11, y_py[i] + 24)) & (F_SOLID | F_PLAT);
-        if (g) { y_vy[i] = -320; }
-        y_hop[i] = 0;
-    }
-
-    /* chase the player */
-    dx = px - y_px[i];
-    if (dx < -20 || dx > 20) {
-        if (dx < 0) { y_vx[i] -= 13; if (y_vx[i] < -64) y_vx[i] = -64; }
-        else        { y_vx[i] += 13; if (y_vx[i] >  64) y_vx[i] =  64; }
-    } else y_vx[i] = 0;
-
-    /* gravity */
-    y_vy[i] += 20;
-    if (y_vy[i] > 768) y_vy[i] = 768;
-
-    /* X move */
     y_sx[i] += y_vx[i];
-    dx = y_sx[i] >> 8; y_sx[i] -= dx << 8;
-    if (dx > 0) {
-        f = mflag(y_px[i] + 13 + dx, y_py[i] + 8) | mflag(y_px[i] + 13 + dx, y_py[i] + 20);
-        if (f & F_SOLID) { y_vx[i] = 0; } else y_px[i] += dx;
-    } else if (dx < 0) {
-        f = mflag(y_px[i] + 2 + dx, y_py[i] + 8) | mflag(y_px[i] + 2 + dx, y_py[i] + 20);
-        if (f & F_SOLID) { y_vx[i] = 0; } else y_px[i] += dx;
+    d = y_sx[i] >> 8; y_sx[i] -= d << 8;
+    if (d > 0) {
+        f = mflag(y_px[i] + 13 + d, y_py[i] + 8) | mflag(y_px[i] + 13 + d, y_py[i] + 20);
+        if (f & F_SOLID) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
+    } else if (d < 0) {
+        f = mflag(y_px[i] + 2 + d, y_py[i] + 8) | mflag(y_px[i] + 2 + d, y_py[i] + 20);
+        if (f & F_SOLID) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
     }
-
-    /* Y move */
     y_sy[i] += y_vy[i];
-    dy = y_sy[i] >> 8; y_sy[i] -= dy << 8;
-    if (dy > 0) {
-        int ny = y_py[i] + 23 + dy;
+    d = y_sy[i] >> 8; y_sy[i] -= d << 8;
+    if (d > 0) {
+        int ny = y_py[i] + 23 + d;
         unsigned char crossed = ((y_py[i] + 23) >> 4) < (ny >> 4);
         f = mflag(y_px[i] + 4, ny) | mflag(y_px[i] + 11, ny);
         if ((f & F_SOLID) || ((f & F_PLAT) && crossed)) {
             y_py[i] = (ny & ~15) - 24; y_vy[i] = 0; y_sy[i] = 0;
-        } else y_py[i] += dy;
-    } else if (dy < 0) {
-        int ny = y_py[i] + 1 + dy;
+        } else y_py[i] += d;
+    } else if (d < 0) {
+        int ny = y_py[i] + 1 + d;
         f = mflag(y_px[i] + 4, ny) | mflag(y_px[i] + 11, ny);
         if ((f & F_SOLID) && !(f & F_PLAT)) { y_vy[i] = 0; y_sy[i] = 0; }
-        else y_py[i] += dy;
+        else y_py[i] += d;
+    }
+}
+
+static unsigned char ent_grounded(unsigned char i) {
+    return ((mflag(y_px[i] + 4, y_py[i] + 24) |
+             mflag(y_px[i] + 11, y_py[i] + 24)) & (F_SOLID | F_PLAT)) ? 1 : 0;
+}
+
+/* is a walk in direction dir (0=left 1=right) about to step off a ledge? */
+static unsigned char ent_at_edge(unsigned char i, unsigned char right) {
+    int ex = right ? (y_px[i] + 15) : y_px[i];
+    return !(mflag(ex, y_py[i] + 26) & (F_SOLID | F_PLAT));
+}
+
+static unsigned char player_overlap(unsigned char i) {
+    return (px + 12 >= y_px[i] && px + 3 <= y_px[i] + 15 &&
+            py + 22 >= y_py[i] + 2 && py + 2 <= y_py[i] + 22);
+}
+
+static void spawn_proj(unsigned char kind, int x, int y, int vx8, int vy8) {
+    unsigned char i;
+    for (i = 0; i < 4; i++)
+        if (!pj_on[i]) {
+            pj_on[i] = kind;
+            pj_x[i] = x; pj_y[i] = y; pj_vx[i] = vx8; pj_vy[i] = vy8;
+            return;
+        }
+}
+
+static void ent_update(unsigned char i) {
+    int dx;
+    unsigned char t = e_type[i];
+
+    if (y_state[i] == 3) return;                 /* dead */
+    dx = y_px[i] - (int)cam_x;
+    if (dx < -80 || dx > 320) {                  /* offscreen cull */
+        if (y_state[i] == 1 && ++y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
+        return;
     }
 
-    /* head-bump: player lands on the yorp */
-    if (!dying && vy > 0 &&
-        px + 12 >= y_px[i] && px + 3 <= y_px[i] + 15 &&
-        py + 24 >= y_py[i] && py + 24 <= y_py[i] + 10) {
-        y_state[i] = 1; y_t[i] = 0;
-        vy = -400; pogoing = 0;                 /* small bounce */
-        sfx_play(SFX_BUMP);
+    if (t >= ET_CANNON0) {                       /* ice cannons: fire chunks */
+        static const signed char cvx[4] = { 1, 0, 0, -1 };
+        static const signed char cvy[4] = { -1, -1, 1, -1 };
+        if (++y_t[i] > 110) {
+            unsigned char v = t - ET_CANNON0;
+            y_t[i] = 0;
+            spawn_proj(1, y_px[i], y_py[i] + 8,
+                       (int)cvx[v] * 384, (int)cvy[v] * 384);
+        }
+        return;
     }
 
-    /* animation */
-    if (y_vx[i] > 0)      y_frame[i] = YF_WALK_R0 + ((y_hop[i] >> 3) & 1);
-    else if (y_vx[i] < 0) y_frame[i] = YF_WALK_L0 + ((y_hop[i] >> 3) & 1);
-    else                  y_frame[i] = YF_LOOK0 + ((y_hop[i] >> 4) & 1);
+    if (y_state[i] == 2) {                       /* dying */
+        if (++y_t[i] > 12) y_state[i] = 3;
+        return;
+    }
+    if (y_state[i] == 1) {                       /* stunned (yorp only) */
+        y_frame[i] = 8 + ((y_t[i] >> 3) & 1);
+        if (++y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
+        return;
+    }
+
+    switch (t) {
+    case ET_YORP:
+        if (++y_hop[i] > 40) {
+            if (ent_grounded(i)) y_vy[i] = -320;
+            y_hop[i] = 0;
+        }
+        dx = px - y_px[i];
+        if (dx < -20 || dx > 20) {
+            if (dx < 0) { y_vx[i] -= 13; if (y_vx[i] < -64) y_vx[i] = -64; }
+            else        { y_vx[i] += 13; if (y_vx[i] >  64) y_vx[i] =  64; }
+        } else y_vx[i] = 0;
+        ent_move(i, 1);
+        /* head-bump stuns; side contact shoves keen away */
+        if (!dying && player_overlap(i)) {
+            if (vy > 0 && py + 24 <= y_py[i] + 10) {
+                y_state[i] = 1; y_t[i] = 0;
+                vy = -400; pogoing = 0;
+                sfx_play(SFX_BUMP);
+            } else {
+                vx = (px < y_px[i]) ? -600 : 600;
+                sfx_play(SFX_BUMP);
+            }
+        }
+        if (y_vx[i] > 0)      y_frame[i] = 6 + ((y_hop[i] >> 3) & 1);
+        else if (y_vx[i] < 0) y_frame[i] = 4 + ((y_hop[i] >> 3) & 1);
+        else                  y_frame[i] = 1 + ((y_hop[i] >> 4) & 1);
+        break;
+
+    case ET_GARG: {
+        /* wander; charge when keen is roughly level and lined up */
+        int dy = py - y_py[i];
+        unsigned char charging = 0;
+        dx = px - y_px[i];
+        if (dy > -24 && dy < 24 && dx > -140 && dx < 140) {
+            charging = 1;
+            y_vx[i] = (dx < 0) ? -224 : 224;
+        } else if (y_vx[i] > 96) y_vx[i] = 96;
+        else if (y_vx[i] < -96) y_vx[i] = -96;
+        else if (!y_vx[i]) y_vx[i] = 96;
+        if (!charging && ent_grounded(i) && ent_at_edge(i, y_vx[i] > 0))
+            y_vx[i] = -y_vx[i];                  /* don't walk off ledges */
+        ent_move(i, 1);
+        if (!dying && player_overlap(i)) player_die();
+        y_frame[i] = (y_vx[i] > 0) ? (1 + (charging ? (y_hop[i] >> 2 & 1)
+                                                    : (y_hop[i] >> 3 & 1)))
+                                   : (3 + (charging ? (y_hop[i] >> 2 & 1)
+                                                    : (y_hop[i] >> 3 & 1)));
+        y_hop[i]++;
+        break;
+    }
+
+    case ET_VORT:
+        /* stalk keen; jump every so often */
+        dx = px - y_px[i];
+        y_vx[i] = (dx < 0) ? -128 : 128;
+        if (++y_hop[i] > 70 && ent_grounded(i)) {
+            y_vy[i] = -700; y_hop[i] = 0;
+        }
+        ent_move(i, 1);
+        if (!dying && player_overlap(i)) player_die();
+        if (!ent_grounded(i)) y_frame[i] = (y_vx[i] > 0) ? 4 : 5;
+        else y_frame[i] = ((y_vx[i] > 0) ? 0 : 2) + ((y_hop[i] >> 3) & 1);
+        break;
+
+    case ET_BUTLER:
+        /* patrols; turns at walls and ledges; shoves keen */
+        if (ent_grounded(i) && ent_at_edge(i, y_vx[i] > 0))
+            y_vx[i] = -y_vx[i];
+        ent_move(i, 1);
+        if (!dying && player_overlap(i)) {
+            vx = (px < y_px[i]) ? -700 : 700;
+            sfx_play(SFX_BUMP);
+        }
+        y_hop[i]++;
+        y_frame[i] = ((y_vx[i] > 0) ? 0 : 2) + ((y_hop[i] >> 3) & 1);
+        break;
+
+    case ET_TANK:
+        /* patrols; stops to fire at keen; bulletproof */
+        if (y_t[i] > 100 && y_t[i] < 140) {      /* stopped, aiming */
+            y_vx[i] = 0;
+            if (y_t[i] == 120) {
+                unsigned char right = (px > y_px[i]);
+                spawn_proj(2, y_px[i] + (right ? 14 : -14), y_py[i] + 10,
+                           right ? 512 : -512, 0);
+                nfx_play(NFX_SHOOT);
+                y_hop[i] = right ? 1 : 0;
+            }
+        } else {
+            if (!y_vx[i]) y_vx[i] = (y_hop[i] & 1) ? 96 : -96;
+            if (ent_grounded(i) && ent_at_edge(i, y_vx[i] > 0))
+                y_vx[i] = -y_vx[i];
+        }
+        if (++y_t[i] > 140) y_t[i] = 0;
+        ent_move(i, 1);
+        if (!dying && player_overlap(i)) {
+            vx = (px < y_px[i]) ? -700 : 700;
+            sfx_play(SFX_BUMP);
+        }
+        y_hop[i] = (y_vx[i] > 0) ? 1 : ((y_vx[i] < 0) ? 0 : y_hop[i]);
+        y_frame[i] = ((y_hop[i] & 1) ? 0 : 2) + ((unsigned char)y_px[i] >> 3 & 1);
+        break;
+    }
+}
+
+/* projectiles: 1 = ice chunk (stuns), 2 = enemy ray (kills) */
+static void proj_update(void) {
+    unsigned char i;
+    for (i = 0; i < 4; i++) {
+        int nx, ny;
+        if (!pj_on[i]) continue;
+        nx = pj_x[i] + (pj_vx[i] >> 8);
+        ny = pj_y[i] + (pj_vy[i] >> 8);
+        pj_vx[i] += (pj_vx[i] & 0xFF) ? 0 : 0;   /* integer-ish speeds */
+        pj_x[i] = nx; pj_y[i] = ny;
+        if (nx < (int)cam_x - 32 || nx > (int)cam_x + 288 ||
+            ny < -16 || ny > (int)mapPH + 16) { pj_on[i] = 0; continue; }
+        if (mflag(nx + 8, ny + 4) & F_SOLID) { pj_on[i] = 0; continue; }
+        if (!dying &&
+            nx + 12 >= px + 3 && nx + 4 <= px + 12 &&
+            ny + 8  >= py + 2 && ny     <= py + 22) {
+            if (pj_on[i] == 1) { stun_t = 90; sfx_play(SFX_BUMP); }
+            else player_die();
+            pj_on[i] = 0;
+        }
+    }
 }
 
 /* ------------------------------------------------------------ sprite draw -- */
@@ -900,7 +1159,21 @@ static void draw_16x24(int sx, int sy, unsigned char base) {
 }
 
 static unsigned char upload_slot;               /* slot needing stream, or 0xFF */
-static unsigned char upload_frame;
+static unsigned char upload_frame;              /* (type<<4)|frame key */
+static unsigned char upload_ent;
+
+/* per-type sprite sheet base (bank2 array) resolved at upload time */
+static const unsigned char * const ent_art[5] =
+    { 0, 0, 0, 0, 0 };                 /* filled in main() (banked consts) */
+static const unsigned char *ent_art_ptr(unsigned char t) {
+    switch (t) {
+    case ET_YORP:   return spr_yorp;
+    case ET_GARG:   return spr_garg;
+    case ET_VORT:   return spr_vort;
+    case ET_BUTLER: return spr_butler;
+    default:        return spr_tank;
+    }
+}
 
 static void build_sprites_level(void) {
     unsigned char i, s;
@@ -908,18 +1181,21 @@ static void build_sprites_level(void) {
     /* player */
     draw_16x24(px - (int)cam_x, py - (int)cam_y, (unsigned char)(VT_PLAYER - 256));
 
-    /* yorps: acquire/release slots by visibility */
+    /* entities: acquire/release streaming slots by visibility */
     upload_slot = 0xFF;
     for (i = 0; i < y_n; i++) {
-        int sx = y_px[i] - (int)cam_x;
-        int sy = y_py[i] - (int)cam_y;
-        unsigned char vis = (sx > -16 && sx < 256 && sy > -24 && sy < 192);
+        int sx, sy;
+        unsigned char vis, key;
+        if (e_type[i] >= ET_CANNON0 || y_state[i] == 3) continue;
+        sx = y_px[i] - (int)cam_x;
+        sy = y_py[i] - (int)cam_y;
+        vis = (sx > -16 && sx < 256 && sy > -24 && sy < 192);
         if (!vis) {
             if (y_slot[i] != 0xFF) { slot_owner[y_slot[i]] = 0xFF; y_slot[i] = 0xFF; }
             continue;
         }
         if (y_slot[i] == 0xFF) {
-            for (s = 0; s < 3; s++)
+            for (s = 0; s < N_SLOTS; s++)
                 if (slot_owner[s] == 0xFF) {
                     slot_owner[s] = i; y_slot[i] = s; slot_vframe[s] = 0xFE;
                     break;
@@ -927,13 +1203,17 @@ static void build_sprites_level(void) {
             if (y_slot[i] == 0xFF) continue;     /* no free slot: skip */
         }
         s = y_slot[i];
-        if (slot_vframe[s] != y_frame[i] && upload_slot == 0xFF) {
-            upload_slot = s; upload_frame = y_frame[i];
+        key = (e_type[i] << 4) | y_frame[i];
+        if (y_state[i] == 2) key = 0xFC;          /* dying: keep last art */
+        else if (slot_vframe[s] != key && upload_slot == 0xFF) {
+            upload_slot = s; upload_frame = key; upload_ent = i;
         }
-        if (slot_vframe[s] != 0xFE)          /* something resident: draw it */
-            draw_16x24(sx, sy, (unsigned char)(VT_YORP0 - 256 + s * 6));
+        if (slot_vframe[s] != 0xFE) {
+            if (y_state[i] == 2 && (y_t[i] & 2)) continue;   /* death flicker */
+            draw_16x24(sx, sy, (unsigned char)(VT_SLOT0 - 256 + s * 6));
+        }
     }
-    /* bullet */
+    /* keen's zap */
     if (b_active) {
         int sx = b_px - (int)cam_x, sy = b_py - (int)cam_y;
         unsigned char base = (unsigned char)(VT_BULLET - 256)
@@ -942,6 +1222,21 @@ static void build_sprites_level(void) {
         SMS_addSpriteClipping(sx + 8, sy,     base + 1);
         SMS_addSpriteClipping(sx,     sy + 8, base + 2);
         SMS_addSpriteClipping(sx + 8, sy + 8, base + 3);
+    }
+    /* projectiles */
+    for (i = 0; i < 4; i++) {
+        int sx, sy;
+        if (!pj_on[i]) continue;
+        sx = pj_x[i] - (int)cam_x; sy = pj_y[i] - (int)cam_y;
+        if (pj_on[i] == 1) {                      /* ice chunk 16x16 */
+            SMS_addSpriteClipping(sx,     sy,     (unsigned char)(VT_CHUNK - 256));
+            SMS_addSpriteClipping(sx + 8, sy,     (unsigned char)(VT_CHUNK - 256 + 1));
+            SMS_addSpriteClipping(sx,     sy + 8, (unsigned char)(VT_CHUNK - 256 + 2));
+            SMS_addSpriteClipping(sx + 8, sy + 8, (unsigned char)(VT_CHUNK - 256 + 3));
+        } else {                                   /* enemy ray 16x8 */
+            SMS_addSpriteClipping(sx,     sy, (unsigned char)(VT_ERAY - 256));
+            SMS_addSpriteClipping(sx + 8, sy, (unsigned char)(VT_ERAY - 256 + 1));
+        }
     }
 }
 
@@ -967,8 +1262,9 @@ static void run_level(void) {
             cur_pframe = pframe;
         }
         if (upload_slot != 0xFF) {
-            UNSAFE_SMS_loadNTiles(spr_yorp + (unsigned int)upload_frame * 192,
-                                  VT_YORP0 + upload_slot * 6, 6);
+            UNSAFE_SMS_loadNTiles(ent_art_ptr(upload_frame >> 4)
+                                    + (unsigned int)(upload_frame & 15) * 192,
+                                  VT_SLOT0 + upload_slot * 6, 6);
             slot_vframe[upload_slot] = upload_frame;
             upload_slot = 0xFF;
         }
@@ -984,9 +1280,10 @@ static void run_level(void) {
 
         player_update(ks, kp);
         bullet_update();
+        proj_update();
         {
             unsigned char i;
-            for (i = 0; i < y_n; i++) yorp_update(i);
+            for (i = 0; i < y_n; i++) ent_update(i);
         }
         sfx_update();
 
@@ -1019,21 +1316,10 @@ static void build_sprites_ow(void) {
 }
 
 /* a solid probe point is forgiven if its cell is a gate whose level is done */
-static unsigned char ow_solid_at(int x, int y) {
-    unsigned char i, cx, cy;
-    if (!(mflag(x, y) & F_SOLID)) return 0;
-    cx = (unsigned char)((unsigned int)x >> 4);
-    cy = (unsigned char)((unsigned int)y >> 4);
-    for (i = 0; i < n_blk; i++)
-        if (blk_mx[i] == cx && blk_my[i] == cy && level_done[blk_lvl[i]])
-            return 0;                            /* gate is open */
-    return 1;
-}
-
 static unsigned char ow_blocked(int nx, int ny) {
     /* 12x14 box inside the 16x16 frame */
-    return (ow_solid_at(nx + 2,  ny + 2)  || ow_solid_at(nx + 13, ny + 2) ||
-            ow_solid_at(nx + 2,  ny + 15) || ow_solid_at(nx + 13, ny + 15)) ? 1 : 0;
+    return ((mflag(nx + 2,  ny + 2)  | mflag(nx + 13, ny + 2) |
+             mflag(nx + 2,  ny + 15) | mflag(nx + 13, ny + 15)) & F_SOLID) ? 1 : 0;
 }
 
 static void run_overworld(void) {
@@ -1088,23 +1374,25 @@ static void run_overworld(void) {
         if (px > (int)mapPW - 16) px = (int)mapPW - 16;
         if (py > (int)mapPH - 16) py = (int)mapPH - 16;
 
-        /* enter a level? */
+        /* enter a level? (stand on a city cell, press a button) */
         if (kp & (PORT_A_KEY_1 | PORT_A_KEY_2)) {
+            unsigned char pcx = (unsigned char)((unsigned int)(px + 8) >> 4);
+            unsigned char pcy = (unsigned char)((unsigned int)(py + 8) >> 4);
             for (i = 0; i < n_entries; i++) {
-                int ex0 = (int)en_mx[i] << 4, ey0 = (int)en_my[i] << 4;
-                int ex1 = ex0 + ((int)en_mw[i] << 4), ey1 = ey0 + ((int)en_mh[i] << 4);
-                if (px + 8 >= ex0 && px + 8 < ex1 && py + 8 >= ey0 && py + 8 < ey1) {
-                    sfx_play(SFX_ENTER);
-                    wait_frames(30);
-                    cur_level = en_lvl[i];
-                    {
-                        static char m[] = "ENTERING LEVEL 0";
-                        m[15] = '0' + cur_level;
-                        show_status(m);
-                    }
-                    game_state = STATE_LEVEL;
-                    break;
+                if (en_mx[i] != pcx || en_my[i] != pcy) continue;
+                if (level_done[en_lvl[i]]) break;      /* done: no re-entry */
+                sfx_play(SFX_ENTER);
+                wait_frames(30);
+                cur_level = en_lvl[i];
+                {
+                    static char m[] = "ENTERING LEVEL 00";
+                    m[15] = '0' + cur_level / 10;
+                    m[16] = '0' + cur_level % 10;
+                    if (cur_level < 10) { m[15] = '0' + cur_level; m[16] = 0; }
+                    show_status(m);
                 }
+                game_state = STATE_LEVEL;
+                break;
             }
         }
 
@@ -1113,6 +1401,29 @@ static void run_overworld(void) {
         build_sprites_ow();
     }
     psg_tone_off(); psg_noise_off();
+}
+
+/* ---------------------------------------------------------------- ending -- */
+static void run_win(void) {
+    screen_text_begin();
+    print_at(6, 5,  "WITH ALL FOUR PARTS");
+    print_at(6, 7,  "THE BEAN-WITH-BACON");
+    print_at(6, 9,  "MEGAROCKET IS WHOLE!");
+    print_at(6, 12, "KEEN BLASTS OFF HOME");
+    print_at(6, 14, "AND SAVES THE EARTH.");
+    print_at(6, 18, "FINAL SCORE");
+    print_num(18, 18, score_hi, score_lo);
+    SMS_displayOn();
+    sfx_play(SFX_EXIT);
+    wait_frames(480);
+    /* fresh game state for another run */
+    {
+        unsigned char i;
+        for (i = 0; i < NLEVELS; i++) level_done[i] = 0;
+    }
+    inv_parts = 0; inv_ammo = 0; inv_pogo = 0;
+    score_hi = score_lo = 0;
+    game_state = STATE_TITLE;
 }
 
 /* ------------------------------------------------------------------ title -- */
@@ -1168,6 +1479,7 @@ void main(void) {
         case STATE_TITLE: run_title();     break;
         case STATE_OW:    run_overworld(); break;
         case STATE_LEVEL: run_level();     break;
+        case STATE_WIN:   run_win();       break;
         }
     }
 }
