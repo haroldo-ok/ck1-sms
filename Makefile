@@ -14,19 +14,16 @@ SMSLIB   := SMSlib
 CRT0     := crt0_sms.rel
 PROG     := keen
 
-BANKS    := 2 3 4 5 6 7 8
+include gen/banks.mk
 BANKRELS := $(addprefix build/bank,$(addsuffix .rel,$(BANKS)))
 
 CFLAGS   := -mz80 --peep-file $(SMSLIB)/peep-rules.txt -I$(SMSLIB) -Igen
-LDFLAGS  := -mz80 --no-std-crt0 --data-loc 0xC000 \
-            -Wl-b_BANK2=0x28000 -Wl-b_BANK3=0x38000 -Wl-b_BANK4=0x48000 \
-            -Wl-b_BANK5=0x58000 -Wl-b_BANK6=0x68000 -Wl-b_BANK7=0x78000 \
-            -Wl-b_BANK8=0x88000
+LDFLAGS  := -mz80 --no-std-crt0 --data-loc 0xC000 $(BANKFLAGS)
 
 all: $(PROG).sms
 
 assets:
-	python3 tools/build_assets.py
+	python3 tools/convert_ck1.py
 
 build/main.rel: src/main.c gen/game_data.h
 	@mkdir -p build

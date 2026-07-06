@@ -1,6 +1,10 @@
 #include "game_data.h"
-const unsigned char bg_palette[16]={0,32,8,40,2,34,6,42,21,53,29,61,23,55,31,63};
-const unsigned char spr_palette[16]={0,0,32,8,2,34,6,42,21,53,29,61,23,55,31,63};
+const unsigned char bg_palette[16] = {
+  0,32,8,40,2,34,6,42,21,53,29,61,23,55,31,63,
+};
+const unsigned char spr_palette[16] = {
+  0,0,32,8,2,34,6,42,21,53,29,61,23,55,31,63,
+};
 const unsigned char font_1bpp[472] = {
   0,0,0,0,0,0,0,0,0,64,64,64,64,64,64,0,0,96,96,96,0,0,0,0,
   0,40,40,32,120,48,120,80,16,56,124,84,112,56,20,84,0,228,172,168,80,20,42,106,
@@ -23,11 +27,22 @@ const unsigned char font_1bpp[472] = {
   0,196,68,68,72,40,40,48,0,140,204,76,84,87,83,51,0,196,200,168,176,48,40,72,
   0,68,68,40,56,16,16,16,0,124,12,8,16,16,32,96,
 };
-const unsigned char item_score_hi[11]={0,0,1,3,19,0,0,1,1,1,1};
-const unsigned char item_score_lo[11]={100,200,244,232,136,0,0,244,244,244,244};
-const LevelDesc level_descs[4] = {
-  { lvl0_tiles,11072, lvl0_mtdef,lvl0_mtflags,lvl0_map, lvl0_items,0, lvl0_yorps,0, lvl0_entries,3, lvl0_blocks,2, 7,8,71,69,123, 160,560, 0,0,0,0 },
-  { lvl1_tiles,4480, lvl1_mtdef,lvl1_mtflags,lvl1_map, lvl1_items,25, lvl1_yorps,8, lvl1_entries,0, lvl1_blocks,0, 4,4,116,17,55, 16,208, 111,6,2,2 },
-  { lvl2_tiles,1312, lvl2_mtdef,lvl2_mtflags,lvl2_map, lvl2_items,0, lvl2_yorps,0, lvl2_entries,0, lvl2_blocks,0, 5,5,20,26,19, 32,336, 15,3,2,2 },
-  { lvl3_tiles,3584, lvl3_mtdef,lvl3_mtflags,lvl3_map, lvl3_items,0, lvl3_yorps,2, lvl3_entries,0, lvl3_blocks,0, 6,6,77,49,45, 32,720, 71,8,2,2 },
+const LevelDesc level_descs[17] = {
+  { lvl0_tiles,10336, lvl0_mtdef,lvl0_mtflags,lvl0_map, lvl0_items,0, lvl0_doors,0, lvl0_ents,0, lvl0_entries,40, lvl0_exits,0, 4,5,123,0, 70,73, 192,592 },
+  { lvl1_tiles,4992, lvl1_mtdef,lvl1_mtflags,lvl1_map, lvl1_items,27, lvl1_doors,0, lvl1_ents,8, lvl1_entries,0, lvl1_exits,2, 5,5,62,0, 120,21, 48,240 },
+  { lvl2_tiles,1120, lvl2_mtdef,lvl2_mtflags,lvl2_map, lvl2_items,0, lvl2_doors,0, lvl2_ents,0, lvl2_entries,0, lvl2_exits,2, 11,11,20,0, 24,30, 64,384 },
+  { lvl3_tiles,4544, lvl3_mtdef,lvl3_mtflags,lvl3_map, lvl3_items,133, lvl3_doors,4, lvl3_ents,13, lvl3_entries,0, lvl3_exits,2, 11,11,53,0, 81,53, 64,752 },
+  { lvl4_tiles,4384, lvl4_mtdef,lvl4_mtflags,lvl4_map, lvl4_items,80, lvl4_doors,4, lvl4_ents,10, lvl4_entries,0, lvl4_exits,2, 12,12,46,0, 120,24, 80,288 },
+  { lvl5_tiles,1920, lvl5_mtdef,lvl5_mtflags,lvl5_map, lvl5_items,2, lvl5_doors,0, lvl5_ents,1, lvl5_entries,0, lvl5_exits,2, 6,6,26,0, 24,37, 48,496 },
+  { lvl6_tiles,1312, lvl6_mtdef,lvl6_mtflags,lvl6_map, lvl6_items,0, lvl6_doors,0, lvl6_ents,0, lvl6_entries,0, lvl6_exits,2, 12,12,23,0, 24,40, 48,544 },
+  { lvl7_tiles,6528, lvl7_mtdef,lvl7_mtflags,lvl7_map, lvl7_items,148, lvl7_doors,0, lvl7_ents,22, lvl7_entries,0, lvl7_exits,2, 7,7,80,0, 128,64, 64,800 },
+  { lvl8_tiles,6688, lvl8_mtdef,lvl8_mtflags,lvl8_map, lvl8_items,86, lvl8_doors,2, lvl8_ents,17, lvl8_entries,0, lvl8_exits,2, 6,6,74,0, 80,60, 1088,864 },
+  { lvl9_tiles,1984, lvl9_mtdef,lvl9_mtflags,lvl9_map, lvl9_items,16, lvl9_doors,2, lvl9_ents,1, lvl9_entries,0, lvl9_exits,2, 11,11,28,0, 44,40, 48,544 },
+  { lvl10_tiles,3808, lvl10_mtdef,lvl10_mtflags,lvl10_map, lvl10_items,30, lvl10_doors,2, lvl10_ents,4, lvl10_entries,0, lvl10_exits,2, 10,10,50,0, 54,40, 48,544 },
+  { lvl11_tiles,1856, lvl11_mtdef,lvl11_mtflags,lvl11_map, lvl11_items,2, lvl11_doors,0, lvl11_ents,1, lvl11_entries,0, lvl11_exits,2, 12,12,28,0, 44,40, 48,544 },
+  { lvl12_tiles,2112, lvl12_mtdef,lvl12_mtflags,lvl12_map, lvl12_items,45, lvl12_doors,0, lvl12_ents,18, lvl12_entries,0, lvl12_exits,2, 9,9,30,0, 44,40, 48,544 },
+  { lvl13_tiles,5312, lvl13_mtdef,lvl13_mtflags,lvl13_map, lvl13_items,122, lvl13_doors,8, lvl13_ents,23, lvl13_entries,0, lvl13_exits,2, 4,9,69,0, 128,77, 80,800 },
+  { lvl14_tiles,2624, lvl14_mtdef,lvl14_mtflags,lvl14_map, lvl14_items,173, lvl14_doors,0, lvl14_ents,30, lvl14_entries,0, lvl14_exits,2, 13,13,31,0, 80,80, 48,1184 },
+  { lvl15_tiles,4640, lvl15_mtdef,lvl15_mtflags,lvl15_map, lvl15_items,58, lvl15_doors,6, lvl15_ents,12, lvl15_entries,0, lvl15_exits,4, 10,10,58,0, 142,24, 64,112 },
+  { lvl16_tiles,6240, lvl16_mtdef,lvl16_mtflags,lvl16_map, lvl16_items,74, lvl16_doors,2, lvl16_ents,15, lvl16_entries,0, lvl16_exits,2, 8,8,76,0, 110,72, 48,864 },
 };
