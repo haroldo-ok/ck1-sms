@@ -155,6 +155,7 @@ static unsigned char n_exits;
 static unsigned int cam_x, cam_y;
 static unsigned int cam_c8, cam_r8;       /* cam_x>>3, cam_y>>3 */
 static unsigned int pend_col, pend_row;   /* 0xFFFF = none */
+static unsigned char pend_row_up;         /* 1 = row enters at screen top    */
 static unsigned int pend_col_camr8;       /* row base captured with column   */
 
 /* player */
@@ -418,6 +419,7 @@ static void camera_follow(int tx, int ty) {
     }
     if (nr8 != cam_r8) {
         pend_row = (nr8 > cam_r8) ? (nr8 + 24) : nr8;
+        pend_row_up = (nr8 < cam_r8);        /* row enters at screen top */
         cam_r8 = nr8;
     }
     pend_col_camr8 = cam_r8;
@@ -1281,7 +1283,11 @@ static void run_level(void) {
             upload_slot = 0xFF;
         }
 
-        /* --- map bank for the rest of the frame --- */
+        /* --- map bank: entering strips. A row entering at the bottom
+           (scrolling down) and columns both land in the off-screen part
+           of the 28-row name table, so drawing them here is race-free.
+           A row entering at the TOP (scrolling up) is handled separately,
+           at end of frame, while it is still off-screen (see below). --- */
         SMS_mapROMBank(ld->map_bank);
         if (pend_col != 0xFFFF) { draw_col_now(pend_col); pend_col = 0xFFFF; }
         if (pend_row != 0xFFFF) { draw_row_now(pend_row); pend_row = 0xFFFF; }
@@ -1301,6 +1307,19 @@ static void run_level(void) {
 
         if (!dying)
             camera_follow(px + 8 - 124, py + 12 - 92);
+
+        /* An upward-entering row lands at the top of the screen and would
+           show stale tiles for one frame if drawn after the next VBlank's
+           scroll update. But right now the scroll register still holds the
+           pre-move value, so that row is still one line ABOVE the visible
+           window -- inside the name table's 4-row off-screen cushion. Draw
+           it here, during active display: writing off-screen never races
+           the raster, and next VBlank simply reveals an already-correct row. */
+        if (pend_row != 0xFFFF && pend_row_up) {
+            SMS_mapROMBank(ld->map_bank);
+            draw_row_now(pend_row);
+            pend_row = 0xFFFF;
+        }
 
         build_sprites_level();
     }
@@ -1421,6 +1440,13 @@ static void run_overworld(void) {
 
         sfx_update();
         camera_follow(px + 8 - 124, py + 8 - 92);
+        /* draw an upward-entering row now, while it is still in the
+           off-screen cushion (see run_level for the rationale) */
+        if (pend_row != 0xFFFF && pend_row_up) {
+            SMS_mapROMBank(ld->map_bank);
+            draw_row_now(pend_row);
+            pend_row = 0xFFFF;
+        }
         build_sprites_ow();
     }
     psg_tone_off(); psg_noise_off();

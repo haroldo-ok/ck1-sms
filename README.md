@@ -103,7 +103,14 @@ banks 4-13  the 17 maps (16 levels + world), tile pools + map data, auto-packed
 * **8-way scrolling** — the 32×28 name table is a ring buffer on both axes.
   Crossing an 8-px camera boundary queues the entering column/row strip,
   drawn right after the next VBlank with the left-column blank hiding the
-  seam. The strip/camera math is fuzz-tested (480 k random camera steps).
+  seam. The name table is 224 px tall but only 192 px is displayed, so
+  four tile-rows are always off-screen; strips that enter at the bottom
+  (scrolling down) or as columns land in that off-screen band and can be
+  drawn any time. A row entering at the *top* (scrolling up) would be shown
+  the instant the scroll register moves, so it is drawn at the end of the
+  previous frame while it is still one line above the visible window —
+  inside the off-screen band — which sidesteps the raster race entirely.
+  The strip/camera math is fuzz-tested (480 k random camera steps).
 * **Entities** — a single typed entity system (`ent_update`) drives yorps
   (hop + chase, head-bump stun), gargs (wander + charge, ledge-aware),
   vorticons (stalk + jump, multi-hit), robot guards and tanks (patrol,
@@ -158,5 +165,8 @@ cosmetic or minor gameplay:
 * `tools/jumptest.py` — input reliability: 20 two-frame taps, each must jump.
 * `tools/tptest.py` — walks Keen onto a Mars teleporter pad and asserts he
   warps to the paired pad and back.
+* `tools/seamtest.py` — scrolls the camera up repeatedly in level 1 and
+  verifies the top visible name-table row always matches the map before the
+  scroll register reveals it (guards against the vertical "loading seam").
 * `tools/nttest.py`, `tools/owtest.py` — name-table / scroll validation
   against the map data (these reference the earlier three-level build).
