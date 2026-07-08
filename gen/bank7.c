@@ -686,3 +686,6 @@ const unsigned char lvl7_entries[1] = {
 const unsigned char lvl7_exits[4] = {
   119,12,119,13,
 };
+const unsigned char lvl7_teleports[1] = {
+  0,
+};

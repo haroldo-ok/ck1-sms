@@ -136,6 +136,12 @@ static unsigned char en_mx[MAX_ENTRIES], en_my[MAX_ENTRIES],
                      en_lvl[MAX_ENTRIES], en_done[MAX_ENTRIES];
 static unsigned char n_entries;
 
+/* world-map teleporters: src cell -> dest cell (bidirectional pairs) */
+#define MAX_TELEPORTS 4
+static unsigned char tp_sx[MAX_TELEPORTS], tp_sy[MAX_TELEPORTS],
+                     tp_dx[MAX_TELEPORTS], tp_dy[MAX_TELEPORTS];
+static unsigned char n_teleports;
+
 /* doors (per level): color 0..3 = Y R G B */
 static unsigned char do_mx[MAX_DOORS], do_my[MAX_DOORS], do_col[MAX_DOORS],
                      do_restore[MAX_DOORS], do_open[MAX_DOORS];
@@ -540,6 +546,12 @@ static void load_level(unsigned char lvl) {
             ovr_mx[n_ovr] = en_mx[i]; ovr_my[n_ovr] = en_my[i];
             ovr_mt[n_ovr] = en_done[i]; n_ovr++;
         }
+    }
+    n_teleports = ld->nteleports;
+    if (n_teleports > MAX_TELEPORTS) n_teleports = MAX_TELEPORTS;
+    p = ld->teleports;
+    for (i = 0; i < n_teleports; i++) {
+        tp_sx[i] = *p++; tp_sy[i] = *p++; tp_dx[i] = *p++; tp_dy[i] = *p++;
     }
 
     px = (int)ld->spawn_x; py = (int)ld->spawn_y;
@@ -1331,19 +1343,6 @@ static void run_overworld(void) {
     ow_dir = 0; ow_moving = 0; cur_pframe = 0xFF;
     prev_ks = SMS_getKeysStatus();
 
-    /* all levels beaten? */
-    if (level_done[1] && level_done[2] && level_done[3]) {
-        screen_text_begin();
-        print_at(10, 8,  "YOU MADE IT!");
-        print_at(5, 11, "THE VORTICONS ARE BEATEN");
-        print_at(8, 14, "FINAL SCORE");
-        print_num(20, 14, score_hi, score_lo);
-        SMS_displayOn();
-        wait_frames(600);
-        game_state = STATE_TITLE;
-        return;
-    }
-
     while (game_state == STATE_OW) {
         SMS_waitForVBlank();
         UNSAFE_SMS_copySpritestoSAT();
@@ -1373,6 +1372,30 @@ static void run_overworld(void) {
         if (px < 0) px = 0; if (py < 0) py = 0;
         if (px > (int)mapPW - 16) px = (int)mapPW - 16;
         if (py > (int)mapPH - 16) py = (int)mapPH - 16;
+
+        /* teleporter? (stand on a teleport pad, press a button) */
+        if (kp & (PORT_A_KEY_1 | PORT_A_KEY_2)) {
+            unsigned char pcx = (unsigned char)((unsigned int)(px + 8) >> 4);
+            unsigned char pcy = (unsigned char)((unsigned int)(py + 8) >> 4);
+            for (i = 0; i < n_teleports; i++) {
+                if (tp_sx[i] != pcx || tp_sy[i] != pcy) continue;
+                sfx_play(SFX_ENTER);
+                /* warp: place Keen on the destination cell, snap camera */
+                px = (int)tp_dx[i] << 4;
+                py = (int)tp_dy[i] << 4;
+                if (px > (int)mapPW - 16) px = (int)mapPW - 16;
+                if (py > (int)mapPH - 16) py = (int)mapPH - 16;
+                cam_x = cam_y = 0; scroll_y = 0;
+                camera_follow(px + 8 - 124, py + 8 - 92);
+                cam_c8 = cam_x >> 3; cam_r8 = cam_y >> 3;
+                set_scroll_y_full();
+                full_redraw();
+                SMS_setBGScrollX((unsigned char)(0 - cam_x));
+                SMS_setBGScrollY(scroll_y);
+                prev_ks = SMS_getKeysStatus();   /* swallow the held button */
+                break;
+            }
+        }
 
         /* enter a level? (stand on a city cell, press a button) */
         if (kp & (PORT_A_KEY_1 | PORT_A_KEY_2)) {

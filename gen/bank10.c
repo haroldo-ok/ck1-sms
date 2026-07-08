@@ -386,6 +386,9 @@ const unsigned char lvl15_entries[1] = {
 const unsigned char lvl15_exits[8] = {
   135,4,135,5,21,7,21,8,
 };
+const unsigned char lvl15_teleports[1] = {
+  0,
+};
 const unsigned char lvl10_tiles[3808] = {
   255,255,255,0,255,255,255,0,255,255,255,0,255,255,255,0,255,255,255,0,255,255,255,0,
   255,255,255,0,255,255,255,0,255,255,0,255,255,255,0,248,255,255,0,200,255,255,0,130,
@@ -677,4 +680,7 @@ const unsigned char lvl10_entries[1] = {
 };
 const unsigned char lvl10_exits[4] = {
   47,5,47,6,
+};
+const unsigned char lvl10_teleports[1] = {
+  0,
 };

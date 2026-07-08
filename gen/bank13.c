@@ -440,3 +440,6 @@ const unsigned char lvl14_entries[1] = {
 const unsigned char lvl14_exits[4] = {
   9,49,9,50,
 };
+const unsigned char lvl14_teleports[1] = {
+  0,
+};

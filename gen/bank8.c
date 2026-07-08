@@ -648,3 +648,6 @@ const unsigned char lvl16_entries[1] = {
 const unsigned char lvl16_exits[4] = {
   104,9,104,10,
 };
+const unsigned char lvl16_teleports[1] = {
+  0,
+};
