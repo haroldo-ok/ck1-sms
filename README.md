@@ -116,6 +116,10 @@ banks 4-13  the 17 maps (16 levels + world), tile pools + map data, auto-packed
 * **Win condition** — the four ship parts (joystick, battery, vacuum, fuel)
   are ordinary pickups that set inventory bits; finishing a level with all
   four triggers the ending screen.
+* **World-map teleporters** — the Mars teleporter pair (object markers
+  38/41 in the original data) is emitted as a src-cell → dest-cell table.
+  Standing on a pad and pressing a button warps Keen to its partner and
+  snaps the camera / redraws the name table.
 * **Physics** — 8.8 fixed point (walk 2.25 px/f, gravity ≈0.15, jump −4,
   pogo with squat + auto-bounce and air steering, 14-frame shoot freeze).
 * **Input** — button edges are detected in the game loop against its own
@@ -135,8 +139,8 @@ cosmetic or minor gameplay:
   sprites; the robot guard's 16×16 art is padded to the shared 16×24 slot.
 * Ice chunks **stun** Keen briefly instead of freezing him in an ice cube.
 * The chandelier rope (level 16) is inert — vorticons are simply shootable.
-* The level-13 secret-level teleporter and the world-map teleporter pads are
-  inert (every level is reachable by walking).
+* The level-13 secret-level teleporter is inert; the two Mars world-map
+  teleporter pads work (stand on one, press a button to warp to its pair).
 
 ## Tools
 
@@ -152,5 +156,7 @@ cosmetic or minor gameplay:
   re-entry, and (after granting the parts) that finishing a level reaches
   the win state — all read back from emulated RAM.
 * `tools/jumptest.py` — input reliability: 20 two-frame taps, each must jump.
+* `tools/tptest.py` — walks Keen onto a Mars teleporter pad and asserts he
+  warps to the paired pad and back.
 * `tools/nttest.py`, `tools/owtest.py` — name-table / scroll validation
   against the map data (these reference the earlier three-level build).

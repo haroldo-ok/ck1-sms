@@ -141,6 +141,7 @@ def build(idx):
         if (a['pickupable'] or t in DOOR_COLOR) and a['chgtile']:
             used.add(norm(a['chgtile']))
     entries = []
+    teleports = []
     if idx == 0:
         for i, o in enumerate(lv['objs']):
             o &= 0x7fff
@@ -148,6 +149,18 @@ def build(idx):
                 ct = norm(ATTRS[tmap[i]]['chgtile'])
                 used.add(ct)
                 entries.append((i % W, i // W, o, ct))
+        # Mars teleporter pair: object markers 38 <-> 41 (from CloneKeen's
+        # ep1 teleport_from/dest tables). Emit each endpoint with its
+        # destination cell so stepping on one warps to the other.
+        tp_cells = {}
+        for i, o in enumerate(lv['objs']):
+            o &= 0x7fff
+            if o in (38, 41):
+                tp_cells[o] = (i % W, i // W)
+        if 38 in tp_cells and 41 in tp_cells:
+            a, b = tp_cells[38], tp_cells[41]
+            teleports.append((a[0], a[1], b[0], b[1]))
+            teleports.append((b[0], b[1], a[0], a[1]))
 
     mts = sorted(used)
     mtidx = {t: i for i, t in enumerate(mts)}
@@ -214,7 +227,8 @@ def build(idx):
                           for q in subs)
     return dict(idx=idx, W=W, H=H, tiles=tiles_blob, mtdef=mtdef,
                 mtflags=bytes(mtflags), mapb=mapb, items=items, doors=doors,
-                exits=exits, ents=ents, entries=entries, spawn=(sx*16, sy*16))
+                exits=exits, ents=ents, entries=entries, teleports=teleports,
+                spawn=(sx*16, sy*16))
 
 levels = [build(i) for i in range(17)]
 
@@ -238,7 +252,8 @@ for lv in sorted(levels, key=lambda l: -(len(l['tiles']))):
     a_size = len(lv['tiles'])
     b_size = (len(lv['mtdef'])*2 + len(lv['mtflags']) + len(lv['mapb']) +
               len(lv['items'])*4 + len(lv['doors'])*4 + len(lv['ents'])*3 +
-              len(lv['entries'])*4 + len(lv['exits'])*2 + 64)
+              len(lv['entries'])*4 + len(lv['exits'])*2 +
+              len(lv['teleports'])*4 + 64)
     if a_size + b_size <= BANK_CAP:
         b = alloc(a_size + b_size)
         lv['bank'] = lv['map_bank'] = b
@@ -399,6 +414,9 @@ for b in sorted(banks):
                 ex = []
                 for (mx,my) in lv['exits']: ex += [mx,my]
                 carr(f, p+'_exits', bytes(ex) or b'\0')
+                tp = []
+                for (sx,sy,dx,dy) in lv['teleports']: tp += [sx,sy,dx,dy]
+                carr(f, p+'_teleports', bytes(tp) or b'\0')
 
 with open(os.path.join(GEN,'game_data.h'), 'w') as f:
     f.write('#ifndef GAME_DATA_H\n#define GAME_DATA_H\n')
@@ -414,6 +432,7 @@ with open(os.path.join(GEN,'game_data.h'), 'w') as f:
     f.write('  const unsigned char *ents;    unsigned char nents;\n')
     f.write('  const unsigned char *entries; unsigned char nentries;\n')
     f.write('  const unsigned char *exits;   unsigned char nexits;\n')
+    f.write('  const unsigned char *teleports; unsigned char nteleports;\n')
     f.write('  unsigned char bank, map_bank, nmt, W2;\n')
     f.write('  unsigned int W, H;\n')
     f.write('  int spawn_x, spawn_y;\n')
@@ -429,8 +448,9 @@ with open(os.path.join(GEN,'game_data.h'), 'w') as f:
     for i in range(17):
         p = 'lvl%d' % i
         f.write('extern const unsigned char %s_tiles[],%s_mtflags[],%s_map[],'
-                '%s_items[],%s_doors[],%s_ents[],%s_entries[],%s_exits[];\n'
-                % (p,p,p,p,p,p,p,p))
+                '%s_items[],%s_doors[],%s_ents[],%s_entries[],%s_exits[],'
+                '%s_teleports[];\n'
+                % (p,p,p,p,p,p,p,p,p))
         f.write('extern const unsigned int %s_mtdef[];\n' % p)
     f.write('#endif\n')
 
@@ -444,11 +464,12 @@ with open(os.path.join(GEN,'game_data.c'), 'w') as f:
         lv, p = levels[i], 'lvl%d' % i
         f.write('  { %s_tiles,%d, %s_mtdef,%s_mtflags,%s_map, '
                 '%s_items,%d, %s_doors,%d, %s_ents,%d, %s_entries,%d, '
-                '%s_exits,%d, %d,%d,%d,0, %d,%d, %d,%d },\n'
+                '%s_exits,%d, %s_teleports,%d, %d,%d,%d,0, %d,%d, %d,%d },\n'
                 % (p, len(lv['tiles']), p, p, p,
                    p, len(lv['items']), p, len(lv['doors']),
                    p, len(lv['ents']), p, len(lv['entries']),
                    p, len(lv['exits']),
+                   p, len(lv['teleports']),
                    lv['bank'], lv['map_bank'], len(lv['mtflags']),
                    lv['W'], lv['H'], lv['spawn'][0], lv['spawn'][1]))
     f.write('};\n')

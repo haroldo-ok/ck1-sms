@@ -29,7 +29,7 @@ def poke16(a, v):
 
 A_LV, A_GS, A_DONE = 0xC002, 0xC003, 0xC004
 A_PARTS = 0xC01C
-A_PX, A_PY = 0xC86D, 0xC86F
+A_PX, A_PY = 0xC87E, 0xC880
 
 BTN = {'U':1,'D':2,'L':4,'R':8,'1':16,'2':32}
 def frames(n, *bt):
