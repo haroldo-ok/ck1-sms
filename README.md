@@ -108,14 +108,23 @@ banks 4-13  the 17 maps (16 levels + world), tile pools + map data, auto-packed
   collision flags themselves never change, so physics probes stay cheap.
 * **8-way scrolling** — the 32×28 name table is a ring buffer on both axes.
   Crossing an 8-px camera boundary queues the entering column/row strip,
-  drawn inside the VBlank window (~16 k cycles) in the same frame that
-  moves the scroll registers. Vertically the name table is 224 px tall
-  but only 192 px shows, so rows always enter in the off-screen band;
+  baked into RAM buffers at the end of the frame (map reads, override
+  lookups, metatile math, even the VRAM address stream) and blitted in
+  the next VBlank as pure port writes, in the same frame that moves the
+  scroll registers. Vertically the name table is 224 px tall but only
+  192 px shows, so rows always enter in the off-screen band;
   horizontally the hardware's blanked left column gives an 8-px cushion:
   while the camera sits inside a tile, the wrapping column's stale half
   is entirely under the blank, so a swap done during VBlank is invisible
   at both edges. Drawing strips a frame late instead is what produced
-  the 1-3 px "loading seams". The strip/camera math is fuzz-tested
+  the 1-3 px "loading seams". **Everything that hits the VDP with raw
+  ports or `UNSAFE_*` OUTI bursts fits inside the ~16 k-cycle VBlank
+  window** (measured worst case ~9 k, enforced by a test): past the end
+  of VBlank the VDP silently drops over-fast writes, which corrupts the
+  sprite table and streamed art. On frames where a column and a row both
+  cross (diagonal scroll), sprite-art streaming is deferred one frame to
+  keep the margin. Teleporter full-redraws happen with the display on
+  and use a paced writer instead. The strip/camera math is fuzz-tested
   (480 k random camera steps).
 * **Entities** — a single typed entity system (`ent_update`) drives yorps
   (hop + chase, head-bump stun), gargs (wander + charge, ledge-aware),
@@ -184,5 +193,10 @@ cosmetic or minor gameplay:
 * `tools/seamtest.py` — scrolls the camera up repeatedly in level 1 and
   verifies the top visible name-table row always matches the map before the
   scroll register reveals it (guards against the vertical "loading seam").
+* `tools/vblanktest.py` — jump-runs through level 13 and measures, on
+  every non-overrun frame, how long the engine's VBlank section takes
+  (SAT copy + scroll + art streaming + strip blits); fails if any frame
+  exceeds the hardware VBlank window, since spilling drops VRAM writes
+  and corrupts sprites.
 * `tools/nttest.py`, `tools/owtest.py` — name-table / scroll validation
   against the map data (these reference the earlier three-level build).
