@@ -80,7 +80,8 @@ def build_sprite_palette(grids):
     while len(used) > 15:
         victim = min(used, key=lambda e: counts[e])
         used.remove(victim)
-        near = min(used, key=lambda e: sum((a-b)**2 for a,b in zip(EGA[e],EGA[victim])))
+        near = min(used, key=lambda e: sum(w*(a-b)**2 for w,a,b in
+                   zip((2,4,3), EGA[e], EGA[victim])))
         remap[victim] = near
         counts[near] += counts.pop(victim)
         print('sprite palette: remapping EGA %d -> %d' % (victim, near))
@@ -165,6 +166,9 @@ def build(idx):
     mts = sorted(used)
     mtidx = {t: i for i, t in enumerate(mts)}
     assert len(mts) <= 255, 'level %d: %d metatiles' % (idx, len(mts))
+    # entries were collected before the metatile set existed; their "done"
+    # tile is still a global CK1 index -- remap to the local metatile index
+    entries = [(mx, my, l, mtidx[ct]) for (mx, my, l, ct) in entries]
 
     # ---- subtiles with flip dedup
     subs, scache = [], {}
@@ -206,8 +210,11 @@ def build(idx):
             items.append((mx, my, kind, mtidx[norm(a['chgtile'])]))
         if idx and t in DOOR_COLOR:
             doors.append((mx, my, DOOR_COLOR[t], mtidx[norm(a['chgtile'])]))
-        if idx and t == EXIT_TILE:
+        if (idx and t == EXIT_TILE):
             exits.append((mx, my))
+
+    # items sorted by column so the engine can scan just a small mx window
+    items.sort(key=lambda it: (it[0], it[1]))
 
     # ---- enemies (codes 1..9); 10=rope and >10 special data are inert
     ents = []
@@ -287,16 +294,16 @@ def ega_frame(si, w=16, h=24):
                 g[y][x] = px[sy][sx2]
     return g
 
-GARG_F   = [60, 64, 65, 66, 67]              # stand, walkR x2, walkL x2
-VORT_F   = [74, 75, 70, 71, 80, 81]          # walkR x2, walkL x2, jumpR/L
+GARG_F   = [60, 64, 65, 66, 67, 68, 69]      # stand, wR x2, wL x2, dying, dead
+VORT_F   = [74, 75, 70, 71, 80, 81, 85, 87]  # wR x2, wL x2, jump R/L, dying, dead
 BUTLER_F = [88, 89, 92, 93]                  # walkR x2, walkL x2 (16x16)
 TANK_F   = [98, 99, 102, 103]                # walkR x2, walkL x2
 garg_frames   = [ega_frame(i) for i in GARG_F]
 vort_frames   = [ega_frame(i) for i in VORT_F]
 butler_frames = [ega_frame(i) for i in BUTLER_F]
 tank_frames   = [ega_frame(i) for i in TANK_F]
-eray_frame    = ega_frame(109, 16, 8)
-chunk_frame   = ega_frame(110, 16, 16)
+eray_frame    = ega_frame(109, 16, 8)        # green enemy zap
+chunk_frame   = ega_frame(112, 16, 16)       # the flying ice cube
 
 allspr = [keen_g, owk_g, blt_g, yorp_g] + garg_frames + vort_frames + \
          butler_frames + tank_frames + [eray_frame, chunk_frame]

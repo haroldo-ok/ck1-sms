@@ -63,8 +63,14 @@ make           # -> keen.sms
   it's a pickup / door / exit, its point value and its post-pickup
   replacement tile.
 * **EGA sprites** — `EGASPRIT` stores each sprite as four colour planes
-  plus a mask plane, packed as a continuous per-plane bitstream, indexed by
-  an `EGAHEAD` table (whose records repeat four times).
+  plus a mask plane (bit set = transparent), each plane one continuous
+  bitstream across all sprites, described by an `EGAHEAD` table (whose
+  records repeat four times). The garg, vorticon, robot guard, tank,
+  enemy ray and ice-chunk art are cut straight from it. One decoder
+  subtlety cost a lot of debugging: at 12-bit codes Keen's LZW still
+  defines dictionary entry 4095 (adding stops only at 4096); stopping one
+  entry early makes code 4095 decode to an empty string, silently
+  dropping bytes mid-stream and shifting every later sprite's planes.
 * **Levels** — a dword length followed by RLE-compressed 16-bit words
   (`0xFEFE` marker / count / value). Header word 7 is the plane size; the
   tile plane starts at word 16 and the object plane just after it. Object
@@ -102,19 +108,21 @@ banks 4-13  the 17 maps (16 levels + world), tile pools + map data, auto-packed
   collision flags themselves never change, so physics probes stay cheap.
 * **8-way scrolling** — the 32×28 name table is a ring buffer on both axes.
   Crossing an 8-px camera boundary queues the entering column/row strip,
-  drawn right after the next VBlank with the left-column blank hiding the
-  seam. The name table is 224 px tall but only 192 px is displayed, so
-  four tile-rows are always off-screen; strips that enter at the bottom
-  (scrolling down) or as columns land in that off-screen band and can be
-  drawn any time. A row entering at the *top* (scrolling up) would be shown
-  the instant the scroll register moves, so it is drawn at the end of the
-  previous frame while it is still one line above the visible window —
-  inside the off-screen band — which sidesteps the raster race entirely.
-  The strip/camera math is fuzz-tested (480 k random camera steps).
+  drawn inside the VBlank window (~16 k cycles) in the same frame that
+  moves the scroll registers. Vertically the name table is 224 px tall
+  but only 192 px shows, so rows always enter in the off-screen band;
+  horizontally the hardware's blanked left column gives an 8-px cushion:
+  while the camera sits inside a tile, the wrapping column's stale half
+  is entirely under the blank, so a swap done during VBlank is invisible
+  at both edges. Drawing strips a frame late instead is what produced
+  the 1-3 px "loading seams". The strip/camera math is fuzz-tested
+  (480 k random camera steps).
 * **Entities** — a single typed entity system (`ent_update`) drives yorps
   (hop + chase, head-bump stun), gargs (wander + charge, ledge-aware),
   vorticons (stalk + jump, multi-hit), robot guards and tanks (patrol,
-  bulletproof; tanks fire a ray), and ice cannons (fire ice chunks). Up to
+  bulletproof; tanks fire a ray), and ice cannons (fire ice chunks).
+  Killed enemies play their original dying frame and leave a corpse
+  (a live enemy can take over a corpse's art slot if all are busy). Up to
   **eight** on-screen entities share eight VRAM streaming slots, one sprite
   upload per frame; offscreen entities skip their AI.
 * **Doors & keycards** — each colour's cells open together when Keen bumps
@@ -127,6 +135,14 @@ banks 4-13  the 17 maps (16 levels + world), tile pools + map data, auto-packed
   38/41 in the original data) is emitted as a src-cell → dest-cell table.
   Standing on a pad and pressing a button warps Keen to its partner and
   snaps the camera / redraws the name table.
+* **Performance** — pickups are checked against a column-sorted item
+  table through a cached window (a handful of items per frame instead of
+  the whole table); entity AI and sprite building walk a page-prefiltered
+  near list; entity sprites are written straight into SMSlib's sprite
+  buffers; and picked-up/opened/completed cell overrides are kept
+  row-bucketed so scroll strips look up a cell's override in O(row
+  entries) — with 100+ items collected a naive full-list scan per cell
+  used to blow entire frames on every scrolled column.
 * **Physics** — 8.8 fixed point (walk 2.25 px/f, gravity ≈0.15, jump −4,
   pogo with squat + auto-bounce and air steering, 14-frame shoot freeze).
 * **Input** — button edges are detected in the game loop against its own
