@@ -357,11 +357,32 @@ static unsigned char mflag(int wx, int wy) {
 }
 
 /* -------------------------------------------------------------- NT strips -- */
-static void draw_col_now(unsigned int wc) {
-    unsigned char r, nty, sub;
-    unsigned int wr, addr;
+/* Scroll strips are split in two: render_* runs during game logic and
+   bakes the strip's tile words into a RAM buffer (all the map reads,
+   override lookups and metatile math happen there), and blit_* runs in
+   the VBlank window doing nothing but address setup + data writes. The
+   VBlank section must stay well inside ~16k cycles: the UNSAFE_* OUTI
+   bursts (SAT copy, sprite art) silently DROP writes if they spill into
+   active display -- that showed up as sprites snapping to the screen
+   edge and corrupted sprite frames while scrolling. */
+__sfr __at 0xBF VDPCtrlPort;              /* raw ports: the blits below   */
+__sfr __at 0xBE VDPDataPort;              /* run in vblank and must be    */
+                                          /* fast, not paced              */
+static unsigned int  colbuf[28];       /* tile words                     */
+static unsigned int  colbuf_a[28];     /* their VRAM addresses           */
+static unsigned char colbuf_n, col_ready;
+static unsigned int  rowbuf[32];
+static unsigned int  rowbuf_a0, rowbuf_a1;  /* run starts (a1 = after NT wrap) */
+static unsigned char rowbuf_n1, rowbuf_n, row_ready;
+
+static void render_col(unsigned int wc) {
+    unsigned char r, sub;
+    unsigned int wr;
     const unsigned char *mrow;
     const unsigned int  *mtsub;
+    unsigned char nty;
+    unsigned int addr;
+    colbuf_n = 0;
     if (wc >= (mapW << 1)) return;
     wr    = pend_col_camr8;
     nty   = (unsigned char)(wr % 28);
@@ -374,37 +395,77 @@ static void draw_col_now(unsigned int wc) {
         if (wr >= (mapH << 1)) break;
         m = *mrow;
         if (n_ovr) m = cell_mt(wc >> 1, wr >> 1);
-        SMS_setAddr(addr);
-        SMS_setTile(mtsub[(unsigned int)m << 2]);
+        colbuf[r]   = mtsub[(unsigned int)m << 2];
+        colbuf_a[r] = addr;
+        colbuf_n++;
         if (++nty == 28) { nty = 0; addr -= 28u * 64u; }
         addr += 64;
         if (wr & 1) { mrow += mapW; mtsub -= 2; }
         else        { mtsub += 2; }
     }
+    col_ready = 1;
 }
 
-static void draw_row_now(unsigned int wr) {
-    unsigned char c, ntx, nty, sub;
-    unsigned int wc, rowbase;
+static void blit_col(void) {
+    /* little-endian int buffers stream in exactly the low-byte-first
+       order the VDP ports want */
+    const unsigned char *pa = (const unsigned char *)colbuf_a;
+    const unsigned char *pt = (const unsigned char *)colbuf;
+    unsigned char r;
+    for (r = 0; r < colbuf_n; r++) {
+        VDPCtrlPort = *pa++;
+        VDPCtrlPort = *pa++;
+        VDPDataPort = *pt++;
+        VDPDataPort = *pt++;
+    }
+}
+
+static void render_row(unsigned int wr) {
+    unsigned char c, sub;
+    unsigned int wc;
     const unsigned char *mrow;
     const unsigned int  *mtsub;
+    unsigned char ntx0;
+    unsigned int rowbase;
+    rowbuf_n = 0;
     if (wr >= (mapH << 1)) return;
-    nty     = (unsigned char)(wr % 28);
-    rowbase = SMS_PNTAddress | ((unsigned int)nty << 6);
+    rowbase = SMS_PNTAddress | (((unsigned int)(wr % 28)) << 6);
     wc      = cam_c8 + 1;
-    ntx     = wc & 31;
-    sub     = (wr & 1) << 1;
-    mrow    = map_rom + row_off[wr >> 1];
-    mtsub   = mtdef_rom + sub;
-    SMS_setAddr(rowbase + ((unsigned int)ntx << 1));
+    ntx0    = (unsigned char)(wc & 31);
+    rowbuf_a0 = rowbase + ((unsigned int)ntx0 << 1);
+    rowbuf_a1 = rowbase;                    /* run 2: after the NT wrap */
+    rowbuf_n1 = 32 - ntx0;                  /* entries before the wrap  */
+    sub   = (wr & 1) << 1;
+    mrow  = map_rom + row_off[wr >> 1];
+    mtsub = mtdef_rom + sub;
     for (c = 0; c < 32; c++, wc++) {
         unsigned char m;
         if (wc >= (mapW << 1)) break;
         m = mrow[wc >> 1];
         if (n_ovr) m = cell_mt(wc >> 1, wr >> 1);
-        SMS_setTile(mtsub[((unsigned int)m << 2) + (wc & 1)]);
-        ntx = (ntx + 1) & 31;
-        if (!ntx) SMS_setAddr(rowbase);     /* NT wraps to column 0 */
+        rowbuf[c] = mtsub[((unsigned int)m << 2) + (wc & 1)];
+        rowbuf_n++;
+    }
+    if (rowbuf_n1 > rowbuf_n) rowbuf_n1 = rowbuf_n;
+    row_ready = 1;
+}
+
+static void blit_row(void) {
+    const unsigned char *pt = (const unsigned char *)rowbuf;
+    unsigned char c;
+    VDPCtrlPort = (unsigned char)rowbuf_a0;
+    VDPCtrlPort = (unsigned char)(rowbuf_a0 >> 8);
+    for (c = 0; c < rowbuf_n1; c++) {
+        VDPDataPort = *pt++;
+        VDPDataPort = *pt++;
+    }
+    if (c < rowbuf_n) {
+        VDPCtrlPort = (unsigned char)rowbuf_a1;
+        VDPCtrlPort = (unsigned char)(rowbuf_a1 >> 8);
+        for (; c < rowbuf_n; c++) {
+            VDPDataPort = *pt++;
+            VDPDataPort = *pt++;
+        }
     }
 }
 
@@ -414,11 +475,24 @@ static void nt_write_cell(unsigned int wc, unsigned int wr) {
     SMS_setTileatXY(wc & 31, wr % 28, t);
 }
 
+/* paced variant for use OUTSIDE vblank (teleporter full redraws happen
+   with the display on; raw back-to-back port writes would be dropped) */
+static void blit_col_paced(void) {
+    unsigned char r;
+    for (r = 0; r < colbuf_n; r++) {
+        SMS_setAddr(colbuf_a[r]);
+        SMS_setTile(colbuf[r]);
+    }
+}
+
 static void full_redraw(void) {
     unsigned int c;
     pend_col_camr8 = cam_r8;
-    for (c = 0; c <= 32; c++)
-        draw_col_now(cam_c8 + c);
+    for (c = 0; c <= 32; c++) {
+        render_col(cam_c8 + c);
+        blit_col_paced();
+    }
+    col_ready = row_ready = 0;
     pend_col = pend_row = 0xFFFF;
 }
 
@@ -1361,26 +1435,29 @@ static void run_level(void) {
     while (game_state == STATE_LEVEL) {
         SMS_waitForVBlank();
 
-        /* --- VBlank window (~70 lines, ~16k cycles): everything here
-           completes before the raster resumes, so strips drawn now can
-           never be seen half-updated. Horizontally the 32-col name table
-           has NO off-screen cushion (world col N and N+32 share NT col
-           N&31), so the entering column must be in VRAM in the SAME
-           vblank that moves the scroll register -- one frame late shows
-           1-3 stale pixels at the right edge. Order: strips first, then
-           SAT + scroll (cheap, guaranteed), sprite art last. --- */
-        SMS_mapROMBank(ld->map_bank);
-        if (pend_col != 0xFFFF) { draw_col_now(pend_col); pend_col = 0xFFFF; }
-        if (pend_row != 0xFFFF) { draw_row_now(pend_row); pend_row = 0xFFFF; }
-
+        /* --- VBlank window (~70 lines, ~16k cycles). The UNSAFE_*
+           OUTI bursts MUST finish inside it: past the end of VBlank the
+           VDP drops over-fast writes (corrupted SAT positions / sprite
+           art). So they go first, worst-case ~7k cycles. The strip blits
+           (precomputed in RAM at the end of the previous frame) follow:
+           the entering column has to land in the same VBlank that moves
+           the scroll register or 1-3 stale pixels show at the right
+           edge; with the left-column blank, a swap inside VBlank is
+           invisible at both edges. Blits are plain paced writes, so even
+           an extreme spill cannot corrupt anything. --- */
         UNSAFE_SMS_copySpritestoSAT();
         SMS_setBGScrollX((unsigned char)(0 - cam_x));
         SMS_setBGScrollY(scroll_y);
 
         SMS_mapROMBank(BANK_SPRITES);
-        if (pframe != cur_pframe) {
+        if (col_ready && row_ready)
+            upload_slot = 0xFF;   /* diagonal-crossing frame: both strips
+                                     blit this vblank, defer art streaming
+                                     (build_sprites re-requests it) */
+        else if (pframe != cur_pframe) {
             UNSAFE_SMS_loadNTiles(spr_keen + (unsigned int)pframe * 192, VT_PLAYER, 6);
             cur_pframe = pframe;
+            upload_slot = 0xFF;   /* one 192B burst per frame */
         }
         if (upload_slot != 0xFF) {
             UNSAFE_SMS_loadNTiles(ent_art_ptr(upload_frame >> 4)
@@ -1390,6 +1467,8 @@ static void run_level(void) {
             upload_slot = 0xFF;
         }
         SMS_mapROMBank(ld->map_bank);
+        if (col_ready) { blit_col(); col_ready = 0; }
+        if (row_ready) { blit_row(); row_ready = 0; }
 
         ks = SMS_getKeysStatus();
         kp = ks & ~prev_ks;
@@ -1412,6 +1491,9 @@ static void run_level(void) {
 
         if (!dying)
             camera_follow(px + 8 - 124, py + 12 - 92);
+        /* bake queued strips into RAM now; next VBlank just blits them */
+        if (pend_col != 0xFFFF) { render_col(pend_col); pend_col = 0xFFFF; }
+        if (pend_row != 0xFFFF) { render_row(pend_row); pend_row = 0xFFFF; }
 
         build_sprites_level();
     }
@@ -1456,12 +1538,8 @@ static void run_overworld(void) {
 
     while (game_state == STATE_OW) {
         SMS_waitForVBlank();
-        /* strips first inside vblank, before the scroll reveals them
+        /* UNSAFE bursts first, precomputed strip blits after
            (see run_level for the rationale) */
-        SMS_mapROMBank(ld->map_bank);
-        if (pend_col != 0xFFFF) { draw_col_now(pend_col); pend_col = 0xFFFF; }
-        if (pend_row != 0xFFFF) { draw_row_now(pend_row); pend_row = 0xFFFF; }
-
         UNSAFE_SMS_copySpritestoSAT();
         SMS_setBGScrollX((unsigned char)(0 - cam_x));
         SMS_setBGScrollY(scroll_y);
@@ -1472,6 +1550,8 @@ static void run_overworld(void) {
             cur_pframe = pframe;
         }
         SMS_mapROMBank(ld->map_bank);
+        if (col_ready) { blit_col(); col_ready = 0; }
+        if (row_ready) { blit_row(); row_ready = 0; }
 
         ks = SMS_getKeysStatus();
         kp = ks & ~prev_ks;
@@ -1535,6 +1615,8 @@ static void run_overworld(void) {
 
         sfx_update();
         camera_follow(px + 8 - 124, py + 8 - 92);
+        if (pend_col != 0xFFFF) { render_col(pend_col); pend_col = 0xFFFF; }
+        if (pend_row != 0xFFFF) { render_row(pend_row); pend_row = 0xFFFF; }
         build_sprites_ow();
     }
     psg_tone_off(); psg_noise_off();
