@@ -41,11 +41,19 @@ def lzw_decompress(data, outlen):
                 if numbits < 12:
                     numbits += 1
                     maxidx = (1 << numbits) - 1
-                else:
+                elif nextidx >= (1 << 12):
+                    # per CloneKeen's lz.c: at 12 bits the FINAL entry 4095
+                    # is still defined; adding shuts off only at index 4096.
+                    # Stopping one early silently drops bytes whenever the
+                    # encoder later emits code 4095 (empty string), shifting
+                    # everything decoded after that point.
                     grow_ok = False
         out += strings[code]
         last = code
-    return bytes(out[:outlen])
+    out = out[:outlen]
+    if len(out) < outlen:                     # streams may omit tail padding
+        out += bytes(outlen - len(out))
+    return bytes(out)
 
 # ------------------------------------------------------------ EGA header ---
 def load_header(path):
@@ -118,31 +126,32 @@ def load_sprites(sprit_path, hdr):
     ps = hdr['SpritePlaneSize']
     tab = sprite_table(hdr)
 
-    def reader(plane, bitoff):
-        pos = (hdr['OffSprites'] + plane * ps) * 8 + bitoff
+    def reader(plane):
+        pos = [(hdr['OffSprites'] + plane * ps) * 8]
         def rd():
-            nonlocal pos
-            b = (raw[pos >> 3] >> (7 - (pos & 7))) & 1
-            pos += 1
+            b = (raw[pos[0] >> 3] >> (7 - (pos[0] & 7))) & 1
+            pos[0] += 1
             return b
         return rd
 
-    out = []
-    for s in tab:
-        w, h = s['w'], s['h']
-        px = [[0] * w for _ in range(h)]
-        for p in range(4):
-            rd = reader(p, s['bitoff'])
-            for y in range(h):
-                for x in range(w):
+    # CloneKeen reads each plane as ONE continuous bitstream across all
+    # sprites (the table's OffsetParas/Delta fields are ignored there, and
+    # trusting them shears several sprites).
+    color_rd = [reader(p) for p in range(4)]
+    out = [[[0] * s['w'] for _ in range(s['h'])] for s in tab]
+    for p in range(4):
+        rd = color_rd[p]
+        for si, s in enumerate(tab):
+            for y in range(s['h']):
+                for x in range(s['w']):
                     if rd():
-                        px[y][x] |= (1 << p)
-        rd = reader(4, s['bitoff'])           # mask plane: 1 = opaque
-        for y in range(h):
-            for x in range(w):
-                if not rd():
-                    px[y][x] = -1
-        out.append(px)
+                        out[si][y][x] |= (1 << p)
+    rd = reader(4)                            # mask plane: 1 = TRANSPARENT
+    for si, s in enumerate(tab):
+        for y in range(s['h']):
+            for x in range(s['w']):
+                if rd():
+                    out[si][y][x] = -1
     return out
 
 # --------------------------------------------------------- tile attrs ------

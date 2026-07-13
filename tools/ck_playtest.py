@@ -29,7 +29,12 @@ def poke16(a, v):
 
 A_LV, A_GS, A_DONE = 0xC002, 0xC003, 0xC004
 A_PARTS = 0xC01C
-A_PX, A_PY = 0xC87F, 0xC881
+def _sym(name):
+    for _line in open('keen.map'):
+        _m = re.match(r'\s*0000([0-9A-Fa-f]{4})\s+_%s\b' % name, _line)
+        if _m: return int(_m.group(1), 16)
+    raise SystemExit('symbol %s not found in keen.map' % name)
+A_PX, A_PY = _sym('px'), _sym('py')
 
 BTN = {'U':1,'D':2,'L':4,'R':8,'1':16,'2':32}
 def frames(n, *bt):
@@ -131,6 +136,7 @@ walk_to(l1_cells[0])
 frames(3, '1'); frames(120)
 assert rd8(A_GS) == 1, 're-entered a completed level!'
 print('== re-entry correctly refused')
+screenshot('ck_done_city2.png')
 
 # ---- 5) all parts + finish another level -> win
 poke8(A_PARTS, 0x0F)

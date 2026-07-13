@@ -122,14 +122,35 @@ static unsigned char flags_ram[256];
 static unsigned int  mapW, mapH;        /* in metatiles */
 static unsigned int  mapPW, mapPH;      /* in pixels    */
 
-/* item overrides: cells whose metatile changed after pickup */
+/* item overrides: cells whose metatile changed after pickup. The list is
+   kept SORTED BY ROW with ovr_row0[r] = index of row r's first entry, so
+   a cell lookup scans only its row's few entries instead of the whole
+   list -- with 100+ collected items a per-cell full scan made every
+   scroll strip cost tens of thousands of cycles (the big-level lag). */
+#define MAX_OVR_ROWS 96
 static unsigned char ovr_mx[MAX_OVR], ovr_my[MAX_OVR], ovr_mt[MAX_OVR];
+static unsigned char ovr_row0[MAX_OVR_ROWS + 1];
 static unsigned char n_ovr;
+
+static void ovr_add(unsigned char mx, unsigned char my, unsigned char mt) {
+    unsigned char i, pos;
+    if (n_ovr >= MAX_OVR || my >= MAX_OVR_ROWS) return;
+    pos = ovr_row0[my + 1];                 /* insert at end of my's bucket */
+    for (i = n_ovr; i > pos; i--) {         /* shift tail up (rare, small)  */
+        ovr_mx[i] = ovr_mx[i - 1];
+        ovr_my[i] = ovr_my[i - 1];
+        ovr_mt[i] = ovr_mt[i - 1];
+    }
+    ovr_mx[pos] = mx; ovr_my[pos] = my; ovr_mt[pos] = mt;
+    n_ovr++;
+    for (i = my + 1; i <= MAX_OVR_ROWS; i++) ovr_row0[i]++;
+}
 
 /* items copied to RAM at load */
 static unsigned char it_mx[MAX_OVR], it_my[MAX_OVR], it_kind[MAX_OVR],
                      it_restore[MAX_OVR], it_taken[MAX_OVR];
 static unsigned char n_items;
+static unsigned char it_lo;               /* cached window start (sorted mx) */
 
 /* overworld entries (one per city cell) */
 static unsigned char en_mx[MAX_ENTRIES], en_my[MAX_ENTRIES],
@@ -155,7 +176,6 @@ static unsigned char n_exits;
 static unsigned int cam_x, cam_y;
 static unsigned int cam_c8, cam_r8;       /* cam_x>>3, cam_y>>3 */
 static unsigned int pend_col, pend_row;   /* 0xFFFF = none */
-static unsigned char pend_row_up;         /* 1 = row enters at screen top    */
 static unsigned int pend_col_camr8;       /* row base captured with column   */
 
 /* player */
@@ -184,6 +204,12 @@ static unsigned char  y_hop[MAX_ENT];
 static unsigned char  y_hp[MAX_ENT];
 static unsigned char  y_frame[MAX_ENT];   /* (type<<4)|frame key for streaming */
 static unsigned char  y_slot[MAX_ENT];    /* 0..N_SLOTS-1 or 0xFF */
+static unsigned char  y_pg[MAX_ENT];      /* y_px>>8: byte prefilter page */
+static unsigned char  cam_pg;             /* cam_x>>8, refreshed per frame */
+static unsigned char  near_list[MAX_ENT]; /* indices of page-near entities */
+static unsigned char  n_near;             /* entries in near_list */
+static unsigned char  near_timer;         /* frames since last rebuild */
+static unsigned char  near_pg;            /* cam_pg at last rebuild */
 static unsigned char  slot_owner[N_SLOTS];
 static unsigned char  slot_vframe[N_SLOTS];
 
@@ -192,6 +218,7 @@ static unsigned char pj_on[4];            /* 0 off, 1 chunk, 2 eray */
 static int pj_x[4], pj_y[4], pj_vx[4], pj_vy[4];
 
 static unsigned char rng;
+static unsigned char frame_ct;               /* free-running frame counter */
 static unsigned char scroll_y;          /* cam_y % 224, kept incrementally */
 static unsigned char anim_ph;           /* walk anim phase 0..2 */
 
@@ -298,11 +325,10 @@ static unsigned int row_off[96];
 /* --------------------------------------------------------------- map query - */
 static unsigned char cell_mt(unsigned int mx, unsigned int my) {
     unsigned char m = map_rom[row_off[my] + mx];
-    if (n_ovr) {
-        unsigned char i;
-        for (i = 0; i < n_ovr; i++)
-            if (ovr_mx[i] == mx && ovr_my[i] == my) { m = ovr_mt[i]; break; }
-    }
+    unsigned char i, e;
+    e = ovr_row0[(unsigned char)my + 1];
+    for (i = ovr_row0[(unsigned char)my]; i < e; i++)
+        if (ovr_mx[i] == mx) { m = ovr_mt[i]; break; }
     return m;
 }
 
@@ -419,7 +445,6 @@ static void camera_follow(int tx, int ty) {
     }
     if (nr8 != cam_r8) {
         pend_row = (nr8 > cam_r8) ? (nr8 + 24) : nr8;
-        pend_row_up = (nr8 < cam_r8);        /* row enters at screen top */
         cam_r8 = nr8;
     }
     pend_col_camr8 = cam_r8;
@@ -506,7 +531,11 @@ static void load_level(unsigned char lvl) {
     /* scroll_y recomputed by callers after camera setup via set_scroll_y_full */
 
     n_ovr = 0;
+    { unsigned char zi;
+      for (zi = 0; zi <= MAX_OVR_ROWS; zi++) ovr_row0[zi] = 0; }
     n_items = ld->nitems;
+    it_lo = 0;
+    n_near = 0; near_timer = 0; near_pg = 0xFF;
     p = ld->items;
     for (i = 0; i < n_items; i++) {
         it_mx[i] = *p++; it_my[i] = *p++; it_kind[i] = *p++; it_restore[i] = *p++;
@@ -528,6 +557,7 @@ static void load_level(unsigned char lvl) {
         unsigned char t = *p++, emx = *p++, emy = *p++;
         e_type[i] = t;
         y_px[i] = (int)emx << 4;
+        y_pg[i] = emx >> 4;                       /* (emx<<4)>>8 */
         y_py[i] = ((int)emy << 4) - (t <= ET_TANK ? 8 : 0);  /* 24px tall */
         y_vx[i] = y_vy[i] = y_sx[i] = y_sy[i] = 0;
         y_state[i] = 0; y_t[i] = (i * 37) & 63; y_hop[i] = (i * 13) & 31;
@@ -544,10 +574,8 @@ static void load_level(unsigned char lvl) {
     for (i = 0; i < n_entries && i < MAX_ENTRIES; i++) {
         en_mx[i] = *p++; en_my[i] = *p++; en_lvl[i] = *p++; en_done[i] = *p++;
         /* completed cities render their "done" art and stop being entries */
-        if (level_done[en_lvl[i]] && n_ovr < MAX_OVR) {
-            ovr_mx[n_ovr] = en_mx[i]; ovr_my[n_ovr] = en_my[i];
-            ovr_mt[n_ovr] = en_done[i]; n_ovr++;
-        }
+        if (level_done[en_lvl[i]])
+            ovr_add(en_mx[i], en_my[i], en_done[i]);
     }
     n_teleports = ld->nteleports;
     if (n_teleports > MAX_TELEPORTS) n_teleports = MAX_TELEPORTS;
@@ -808,24 +836,27 @@ static void player_update(unsigned int ks, unsigned int kp) {
     /* fell out of the world */
     if (py > (int)mapPH + 16) { player_die(); seq_timer = 120; return; }
 
-    /* items: cheap byte prefilter (cell distance) before the full AABB */
+    /* items: the table is sorted by column; keep a cached start index and
+       scan only items with mx in [pcx-1, pcx+1]. The cache follows the
+       player incrementally, so per-frame cost is a handful of items
+       instead of the whole table (up to ~170 on big levels). */
     {
     unsigned char pcx = (unsigned char)((unsigned int)(px + 8) >> 4);
     unsigned char pcy = (unsigned char)((unsigned int)(py + 12) >> 4);
-    for (i = 0; i < n_items; i++) {
+    unsigned char lo = it_lo;
+    while (lo && (unsigned char)(it_mx[lo - 1] + 1) >= pcx) lo--;
+    while (lo < n_items && (unsigned char)(it_mx[lo] + 1) < pcx) lo++;
+    it_lo = lo;
+    for (i = lo; i < n_items && it_mx[i] <= (unsigned char)(pcx + 1); i++) {
         int cx, cy;
         if (it_taken[i]) continue;
-        if ((unsigned char)(it_mx[i] - pcx + 1) > 2) continue;
         if ((unsigned char)(it_my[i] - pcy + 1) > 2) continue;
         cx = (int)it_mx[i] << 4; cy = (int)it_my[i] << 4;
         if (px + 12 >= cx && px + 3 <= cx + 15 &&
             py + 23 >= cy && py + 1 <= cy + 15) {
             unsigned char k = it_kind[i];
             it_taken[i] = 1;
-            if (n_ovr < MAX_OVR) {
-                ovr_mx[n_ovr] = it_mx[i]; ovr_my[n_ovr] = it_my[i];
-                ovr_mt[n_ovr] = it_restore[i]; n_ovr++;
-            }
+            ovr_add(it_mx[i], it_my[i], it_restore[i]);
             nt_update_cell(it_mx[i], it_my[i]);
             add_score(k);
             if (k == K_AMMO)      { inv_ammo += 5; sfx_play(SFX_KEYCARD); }
@@ -865,10 +896,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
                 for (j = 0; j < n_doors; j++)      /* whole door (all cells) */
                     if (do_col[j] == c && !do_open[j]) {
                         do_open[j] = 1; n_open_doors++;
-                        if (n_ovr < MAX_OVR) {
-                            ovr_mx[n_ovr] = do_mx[j]; ovr_my[n_ovr] = do_my[j];
-                            ovr_mt[n_ovr] = do_restore[j]; n_ovr++;
-                        }
+                        ovr_add(do_mx[j], do_my[j], do_restore[j]);
                         nt_update_cell(do_mx[j], do_my[j]);
                     }
                 sfx_play(SFX_KEYCARD);
@@ -947,6 +975,7 @@ static void ent_move(unsigned char i, unsigned char gravity) {
         f = mflag(y_px[i] + 2 + d, y_py[i] + 8) | mflag(y_px[i] + 2 + d, y_py[i] + 20);
         if (f & F_SOLID) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
     }
+    y_pg[i] = (unsigned char)(((unsigned int)y_px[i]) >> 8);
     y_sy[i] += y_vy[i];
     d = y_sy[i] >> 8; y_sy[i] -= d << 8;
     if (d > 0) {
@@ -990,6 +1019,31 @@ static void spawn_proj(unsigned char kind, int x, int y, int vx8, int vy8) {
         }
 }
 
+/* Rebuild the near-entity list: everything within x-pages cam_pg-1..
+   cam_pg+2 (>=256px of slack around the AI wake window). Rebuilt every 8
+   frames or when the camera page changes; entities and camera drift well
+   under a page in that time, so nothing can slip in or out unseen. This
+   lets the per-frame entity loops touch ~6 indices instead of MAX_ENT --
+   SDCC's per-access array indexing makes even "filtered" iterations
+   expensive, so shrinking N is worth more than any per-iteration trim. */
+static void rebuild_near(void) {
+    unsigned char i, n = 0;
+    for (i = 0; i < y_n; i++) {
+        if ((unsigned char)(y_pg[i] - cam_pg + 1) <= 3) {
+            near_list[n++] = i;
+        } else {
+            /* far away: release any sprite slot it still holds and give
+               stunned ones their recovery ticks for the skipped frames */
+            if (y_slot[i] != 0xFF) { slot_owner[y_slot[i]] = 0xFF; y_slot[i] = 0xFF; }
+            if (y_state[i] == 1) {
+                y_t[i] += 8;
+                if (y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
+            }
+        }
+    }
+    n_near = n;
+}
+
 static void ent_update(unsigned char i) {
     int dx;
     unsigned char t = e_type[i];
@@ -998,6 +1052,13 @@ static void ent_update(unsigned char i) {
     dx = y_px[i] - (int)cam_x;
     if (dx < -80 || dx > 320) {                  /* offscreen cull */
         if (y_state[i] == 1 && ++y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
+        return;
+    }
+    if ((dx < -16 || dx > 256) && ((frame_ct ^ i) & 1)) {
+        /* in the wake window but not on screen: think at half rate.
+           On-screen behavior is untouched; offscreen walkers just cover
+           ground a little slower, close to the original's sleep-until-
+           seen behavior. */
         return;
     }
 
@@ -1014,7 +1075,11 @@ static void ent_update(unsigned char i) {
     }
 
     if (y_state[i] == 2) {                       /* dying */
-        if (++y_t[i] > 12) y_state[i] = 3;
+        y_frame[i] = (t == ET_YORP) ? 10 : ((t == ET_GARG) ? 5 : 6);
+        if (++y_t[i] > 12) {
+            y_state[i] = 3;                      /* corpse stays visible */
+            y_frame[i] = (t == ET_YORP) ? 11 : ((t == ET_GARG) ? 6 : 7);
+        }
         return;
     }
     if (y_state[i] == 1) {                       /* stunned (yorp only) */
@@ -1152,16 +1217,34 @@ static void proj_update(void) {
 }
 
 /* ------------------------------------------------------------ sprite draw -- */
+/* SMSlib's sprite buffers (global in the lib, just not in the header).
+   Format per SMS_addSprite_f: Y[i] = y-1, XN[2i] = x, XN[2i+1] = tile.
+   Writing them directly skips six function calls per entity. Safe here
+   because the fast path's y is at most 168+16+... < 0xD1 (the one value
+   addSprite must reject) and we bounds-check SpriteNextFree ourselves. */
+extern unsigned char SpriteTableY[64];
+extern unsigned char SpriteTableXN[128];
+extern unsigned char SpriteNextFree;
+
 static void draw_16x24(int sx, int sy, unsigned char base) {
     if ((unsigned int)sx <= 240 && (unsigned int)sy <= 168) {
-        /* fully on-screen: skip the clipping math */
-        unsigned char x = (unsigned char)sx, y = (unsigned char)sy;
-        SMS_addSprite(x,     y,      base);
-        SMS_addSprite(x + 8, y,      base + 1);
-        SMS_addSprite(x,     y + 8,  base + 2);
-        SMS_addSprite(x + 8, y + 8,  base + 3);
-        SMS_addSprite(x,     y + 16, base + 4);
-        SMS_addSprite(x + 8, y + 16, base + 5);
+        /* fully on-screen: write the sprite tables directly */
+        unsigned char x = (unsigned char)sx, y1 = (unsigned char)sy - 1;
+        unsigned char n = SpriteNextFree;
+        unsigned char *ty; unsigned char *xn;
+        if (n > 58) return;
+        ty = SpriteTableY + n;
+        xn = SpriteTableXN + ((unsigned char)(n << 1));
+        ty[0] = y1;      ty[1] = y1;
+        ty[2] = y1 + 8;  ty[3] = y1 + 8;
+        ty[4] = y1 + 16; ty[5] = y1 + 16;
+        xn[0] = x;     xn[1]  = base;
+        xn[2] = x + 8; xn[3]  = base + 1;
+        xn[4] = x;     xn[5]  = base + 2;
+        xn[6] = x + 8; xn[7]  = base + 3;
+        xn[8] = x;     xn[9]  = base + 4;
+        xn[10] = x + 8; xn[11] = base + 5;
+        SpriteNextFree = n + 6;
         return;
     }
     SMS_addSpriteClipping(sx,     sy,      base);
@@ -1190,20 +1273,27 @@ static const unsigned char *ent_art_ptr(unsigned char t) {
 }
 
 static void build_sprites_level(void) {
-    unsigned char i, s;
+    unsigned char i, s, k;
     SMS_initSprites();
     /* player */
     draw_16x24(px - (int)cam_x, py - (int)cam_y, (unsigned char)(VT_PLAYER - 256));
 
-    /* entities: acquire/release streaming slots by visibility */
+    /* entities: acquire/release streaming slots by visibility.
+       Only the near list is walked; rebuild_near releases the slots of
+       entities that dropped out of it. */
     upload_slot = 0xFF;
-    for (i = 0; i < y_n; i++) {
+    for (k = 0; k < n_near; k++) {
         int sx, sy;
         unsigned char vis, key;
-        if (e_type[i] >= ET_CANNON0 || y_state[i] == 3) continue;
+        i = near_list[k];
+        if (e_type[i] >= ET_CANNON0) continue;
         sx = y_px[i] - (int)cam_x;
+        if (sx <= -16 || sx >= 256) {            /* x-invisible: skip sy math */
+            if (y_slot[i] != 0xFF) { slot_owner[y_slot[i]] = 0xFF; y_slot[i] = 0xFF; }
+            continue;
+        }
         sy = y_py[i] - (int)cam_y;
-        vis = (sx > -16 && sx < 256 && sy > -24 && sy < 192);
+        vis = (sy > -24 && sy < 192);
         if (!vis) {
             if (y_slot[i] != 0xFF) { slot_owner[y_slot[i]] = 0xFF; y_slot[i] = 0xFF; }
             continue;
@@ -1214,18 +1304,24 @@ static void build_sprites_level(void) {
                     slot_owner[s] = i; y_slot[i] = s; slot_vframe[s] = 0xFE;
                     break;
                 }
-            if (y_slot[i] == 0xFF) continue;     /* no free slot: skip */
+            if (y_slot[i] == 0xFF && y_state[i] < 3) {
+                /* no free slot: a live enemy may steal a corpse's slot */
+                for (s = 0; s < N_SLOTS; s++)
+                    if (slot_owner[s] != 0xFF && y_state[slot_owner[s]] == 3) {
+                        y_slot[slot_owner[s]] = 0xFF;
+                        slot_owner[s] = i; y_slot[i] = s; slot_vframe[s] = 0xFE;
+                        break;
+                    }
+            }
+            if (y_slot[i] == 0xFF) continue;     /* still none: skip */
         }
         s = y_slot[i];
         key = (e_type[i] << 4) | y_frame[i];
-        if (y_state[i] == 2) key = 0xFC;          /* dying: keep last art */
-        else if (slot_vframe[s] != key && upload_slot == 0xFF) {
+        if (slot_vframe[s] != key && upload_slot == 0xFF) {
             upload_slot = s; upload_frame = key; upload_ent = i;
         }
-        if (slot_vframe[s] != 0xFE) {
-            if (y_state[i] == 2 && (y_t[i] & 2)) continue;   /* death flicker */
+        if (slot_vframe[s] != 0xFE)
             draw_16x24(sx, sy, (unsigned char)(VT_SLOT0 - 256 + s * 6));
-        }
     }
     /* keen's zap */
     if (b_active) {
@@ -1265,7 +1361,18 @@ static void run_level(void) {
     while (game_state == STATE_LEVEL) {
         SMS_waitForVBlank();
 
-        /* --- VBlank window: SAT + streaming + scroll --- */
+        /* --- VBlank window (~70 lines, ~16k cycles): everything here
+           completes before the raster resumes, so strips drawn now can
+           never be seen half-updated. Horizontally the 32-col name table
+           has NO off-screen cushion (world col N and N+32 share NT col
+           N&31), so the entering column must be in VRAM in the SAME
+           vblank that moves the scroll register -- one frame late shows
+           1-3 stale pixels at the right edge. Order: strips first, then
+           SAT + scroll (cheap, guaranteed), sprite art last. --- */
+        SMS_mapROMBank(ld->map_bank);
+        if (pend_col != 0xFFFF) { draw_col_now(pend_col); pend_col = 0xFFFF; }
+        if (pend_row != 0xFFFF) { draw_row_now(pend_row); pend_row = 0xFFFF; }
+
         UNSAFE_SMS_copySpritestoSAT();
         SMS_setBGScrollX((unsigned char)(0 - cam_x));
         SMS_setBGScrollY(scroll_y);
@@ -1282,15 +1389,7 @@ static void run_level(void) {
             slot_vframe[upload_slot] = upload_frame;
             upload_slot = 0xFF;
         }
-
-        /* --- map bank: entering strips. A row entering at the bottom
-           (scrolling down) and columns both land in the off-screen part
-           of the 28-row name table, so drawing them here is race-free.
-           A row entering at the TOP (scrolling up) is handled separately,
-           at end of frame, while it is still off-screen (see below). --- */
         SMS_mapROMBank(ld->map_bank);
-        if (pend_col != 0xFFFF) { draw_col_now(pend_col); pend_col = 0xFFFF; }
-        if (pend_row != 0xFFFF) { draw_row_now(pend_row); pend_row = 0xFFFF; }
 
         ks = SMS_getKeysStatus();
         kp = ks & ~prev_ks;
@@ -1300,26 +1399,19 @@ static void run_level(void) {
         bullet_update();
         proj_update();
         {
-            unsigned char i;
-            for (i = 0; i < y_n; i++) ent_update(i);
+            unsigned char k;
+            frame_ct++;
+            cam_pg = (unsigned char)(((unsigned int)cam_x) >> 8);
+            if (cam_pg != near_pg || ++near_timer >= 8) {
+                near_pg = cam_pg; near_timer = 0;
+                rebuild_near();
+            }
+            for (k = 0; k < n_near; k++) ent_update(near_list[k]);
         }
         sfx_update();
 
         if (!dying)
             camera_follow(px + 8 - 124, py + 12 - 92);
-
-        /* An upward-entering row lands at the top of the screen and would
-           show stale tiles for one frame if drawn after the next VBlank's
-           scroll update. But right now the scroll register still holds the
-           pre-move value, so that row is still one line ABOVE the visible
-           window -- inside the name table's 4-row off-screen cushion. Draw
-           it here, during active display: writing off-screen never races
-           the raster, and next VBlank simply reveals an already-correct row. */
-        if (pend_row != 0xFFFF && pend_row_up) {
-            SMS_mapROMBank(ld->map_bank);
-            draw_row_now(pend_row);
-            pend_row = 0xFFFF;
-        }
 
         build_sprites_level();
     }
@@ -1364,6 +1456,12 @@ static void run_overworld(void) {
 
     while (game_state == STATE_OW) {
         SMS_waitForVBlank();
+        /* strips first inside vblank, before the scroll reveals them
+           (see run_level for the rationale) */
+        SMS_mapROMBank(ld->map_bank);
+        if (pend_col != 0xFFFF) { draw_col_now(pend_col); pend_col = 0xFFFF; }
+        if (pend_row != 0xFFFF) { draw_row_now(pend_row); pend_row = 0xFFFF; }
+
         UNSAFE_SMS_copySpritestoSAT();
         SMS_setBGScrollX((unsigned char)(0 - cam_x));
         SMS_setBGScrollY(scroll_y);
@@ -1373,10 +1471,7 @@ static void run_overworld(void) {
             UNSAFE_SMS_loadNTiles(spr_owk + (unsigned int)pframe * 128, VT_OWKEEN, 4);
             cur_pframe = pframe;
         }
-
         SMS_mapROMBank(ld->map_bank);
-        if (pend_col != 0xFFFF) { draw_col_now(pend_col); pend_col = 0xFFFF; }
-        if (pend_row != 0xFFFF) { draw_row_now(pend_row); pend_row = 0xFFFF; }
 
         ks = SMS_getKeysStatus();
         kp = ks & ~prev_ks;
@@ -1440,13 +1535,6 @@ static void run_overworld(void) {
 
         sfx_update();
         camera_follow(px + 8 - 124, py + 8 - 92);
-        /* draw an upward-entering row now, while it is still in the
-           off-screen cushion (see run_level for the rationale) */
-        if (pend_row != 0xFFFF && pend_row_up) {
-            SMS_mapROMBank(ld->map_bank);
-            draw_row_now(pend_row);
-            pend_row = 0xFFFF;
-        }
         build_sprites_ow();
     }
     psg_tone_off(); psg_noise_off();
