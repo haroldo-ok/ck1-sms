@@ -48,6 +48,8 @@ __sfr __at 0x7F PSGPort;
 #define AIR_ACC      96
 #define GRAV         38
 #define JUMP_V    (-1024)
+#define POGO_LO_V  (-980)    /* pogo bounce  ~= 0.92x max-jump height   */
+#define POGO_HI_V (-1474)    /* held-jump pogo ~= 2.07x max-jump height */
 #define FALL_MAX   1024
 #define POGO_STEER   77
 #define BULLET_V    640
@@ -232,20 +234,15 @@ static unsigned char jump_buf;          /* buffered jump press, frames */
 #define JUMP_BUF_FRAMES 5
 
 /* ------------------------------------------------------------------ sfx --- */
-/* tiny procedural PSG driver: one tone effect (ch2) + one noise (ch3)        */
-static unsigned char sfx_id, sfx_t, nfx_id, nfx_t;
-#define SFX_NONE 0
-#define SFX_JUMP 1
-#define SFX_COLLECT 2
-#define SFX_KEYCARD 3
-#define SFX_DIE 4
-#define SFX_EXIT 5
-#define SFX_BUMP 6
-#define SFX_ZAP 7
-#define SFX_ENTER 8
-#define SFX_CLICK 9
-#define NFX_SHOOT 1
-#define NFX_LAND 2
+/* Plays the ORIGINAL PC-speaker sounds converted from SOUNDS.CK1. Each
+   sound is a sequence of PSG tone periods (the PSG clock is exactly 3x
+   the PC's timer clock, so periods are the original divisors * 3/32);
+   0 = a silent tick, 0xFFFF = end. Values advance at the original rate
+   of ~44/s (44 ticks per 60 frames via an accumulator). One channel,
+   with the original priority rule: a new sound only replaces the
+   current one if its priority is at least as high. */
+static const unsigned int *snd_p;
+static unsigned char snd_on, snd_pri_cur, snd_acc;
 
 static void psg_tone(unsigned int period, unsigned char att) {
     PSGPort = 0xC0 | (period & 0x0F);        /* ch2 tone latch */
@@ -259,64 +256,30 @@ static void psg_noise(unsigned char mode, unsigned char att) {
 }
 static void psg_noise_off(void) { PSGPort = 0xFF; }
 
-static void sfx_play(unsigned char id)  { sfx_id = id; sfx_t = 0; }
-static void nfx_play(unsigned char id)  { nfx_id = id; nfx_t = 0; }
+static void sfx_play(unsigned char id) {
+    unsigned char p = snd_pri[id];
+    if (snd_on && p < snd_pri_cur) return;
+    snd_p = snd_data + snd_off[id];
+    snd_pri_cur = p; snd_on = 1;
+    snd_acc = 60;                      /* first value fires immediately */
+}
 
 static void sfx_update(void) {
-    unsigned char t = sfx_t;
-    switch (sfx_id) {
-    case SFX_JUMP:      /* quick pitch drop, 12 frames */
-        if (t >= 12) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(180 + ((unsigned int)t << 4), t >> 1);
-        break;
-    case SFX_COLLECT:   /* two rising blips */
-        if (t >= 8) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(t < 4 ? 220 : 165, (t & 3) << 1);
-        break;
-    case SFX_KEYCARD:   /* 4-step arpeggio */
-        if (t >= 16) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(280 - ((unsigned int)(t >> 2) * 50), 2);
-        break;
-    case SFX_DIE:       /* long slide down */
-        if (t >= 48) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(150 + ((unsigned int)t * 14), t >> 3);
-        break;
-    case SFX_EXIT:      /* slide up */
-        if (t >= 32) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(700 - ((unsigned int)t * 20), 2);
-        break;
-    case SFX_BUMP:
-        if (t >= 5) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(900, 4);
-        break;
-    case SFX_ZAP:       /* alternating buzz */
-        if (t >= 10) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone((t & 1) ? 90 : 140, 3);
-        break;
-    case SFX_ENTER:     /* rising arpeggio, longer */
-        if (t >= 30) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(500 - ((unsigned int)(t / 6) * 80), 2);
-        break;
-    case SFX_CLICK:
-        if (t >= 2) { psg_tone_off(); sfx_id = 0; break; }
-        psg_tone(1000, 6);
-        break;
-    default: break;
+    if (!snd_on) return;
+    snd_acc += 44;
+    while (snd_acc >= 60) {
+        unsigned int v;
+        snd_acc -= 60;
+        v = *snd_p++;
+        if (v == 0xFFFF) {
+            psg_tone_off();
+            snd_on = 0; snd_pri_cur = 0;
+            return;
+        }
+        if (v == 0) psg_tone_off();
+        else        psg_tone(v, 2);
+        if (!snd_on) return;
     }
-    if (sfx_id) sfx_t++;
-    t = nfx_t;
-    switch (nfx_id) {
-    case NFX_SHOOT:
-        if (t >= 7) { psg_noise_off(); nfx_id = 0; break; }
-        psg_noise(0x04, t);              /* white noise, fading */
-        break;
-    case NFX_LAND:
-        if (t >= 3) { psg_noise_off(); nfx_id = 0; break; }
-        psg_noise(0x06, 5);
-        break;
-    default: break;
-    }
-    if (nfx_id) nfx_t++;
 }
 
 /* precomputed my*mapW offsets (mapH <= 69) */
@@ -756,7 +719,7 @@ static void player_move_y(void) {
             py = ((ny & ~15) - 24);
             vy = 0; sy_acc = 0;
             if (!on_ground) {                   /* landing */
-                nfx_play(NFX_LAND);
+                if (!pogoing) sfx_play(SND_LAND);
                 fall_snd_on = 0;
             }
             on_ground = 1; jumping = 0;
@@ -767,7 +730,7 @@ static void player_move_y(void) {
         if ((f & F_SOLID) && !(f & F_PLAT)) {
             py = ((((ny >> 4) + 1) << 4) - 1);
             vy = 0; sy_acc = 0;
-            sfx_play(SFX_BUMP);
+            sfx_play(SND_BUMPHEAD);
         } else py += dy;
         on_ground = 0;
     } else {
@@ -782,19 +745,19 @@ static void player_move_y(void) {
 static void player_die(void) {
     if (dying) return;
     dying = 1; seq_timer = 0;
-    sfx_play(SFX_DIE);
+    sfx_play(SND_DIE);
     vx = vy = 0;
 }
 
 static void spawn_bullet(void) {
-    if (!inv_ammo) { sfx_play(SFX_CLICK); return; }
+    if (!inv_ammo) { sfx_play(SND_GUNCLICK); return; }
     if (b_active) return;
     inv_ammo--;
     b_active = 1; b_hit = 0; b_timer = 0;
     b_right = dir_right;
     b_px = px + (dir_right ? 12 : -12);
     b_py = py + 6;
-    nfx_play(NFX_SHOOT);
+    sfx_play(SND_FIRE);
 }
 
 static void player_update(unsigned int ks, unsigned int kp) {
@@ -812,7 +775,11 @@ static void player_update(unsigned int ks, unsigned int kp) {
         vx = 200; dir_right = 1;
         player_move_x();
         anim_t++;
-        if (!(anim_t & 7) && ++anim_ph == 3) anim_ph = 0;
+        if (!(anim_t & 7)) {
+            if (++anim_ph == 3) anim_ph = 0;
+            if (on_ground)
+                sfx_play((anim_t & 8) ? SND_WALK2 : SND_WALK1);
+        }
         pframe = KF_WALK_R + anim_ph;
         if (seq_timer > 70) {
             level_done[cur_level] = 1;
@@ -831,7 +798,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
     if ((kp & PORT_A_KEY_1) && (ks & PORT_A_KEY_DOWN) && inv_pogo) {
         pogoing = !pogoing;
         pogo_squat = 0;
-        if (pogoing && on_ground) { vy = JUMP_V; on_ground = 0; jumping = 1; sfx_play(SFX_JUMP); }
+        if (pogoing && on_ground) { vy = POGO_LO_V; on_ground = 0; jumping = 1; sfx_play(SND_POGO); }
     }
 
     if (pogoing) {
@@ -843,8 +810,11 @@ static void player_update(unsigned int ks, unsigned int kp) {
             if (!pogo_squat) pogo_squat = 1;
             else if (++pogo_squat > 6) {
                 pogo_squat = 0;
-                vy = JUMP_V; on_ground = 0; jumping = 1;
-                sfx_play(SFX_JUMP);
+                /* holding jump during the bounce gives the original's
+                   high pogo jump (about twice normal jump height) */
+                if (ks & PORT_A_KEY_1) { vy = POGO_HI_V; sfx_play(SND_POGOJUMP); }
+                else                   { vy = POGO_LO_V; sfx_play(SND_POGO); }
+                on_ground = 0; jumping = 1;
             }
         }
         pframe = on_ground ? (dir_right ? KF_POGO_DN_R : KF_POGO_DN_L)
@@ -872,7 +842,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
         if (jump_buf && on_ground) {
             jump_buf = 0;
             vy = JUMP_V; on_ground = 0; jumping = 1;
-            sfx_play(SFX_JUMP);
+            sfx_play(SND_JUMP);
         }
         if (jump_buf) jump_buf--;
     }
@@ -894,7 +864,10 @@ static void player_update(unsigned int ks, unsigned int kp) {
     player_move_y();
 
     /* falling sound trigger */
-    if (!on_ground && vy > 512 && !jumping && !fall_snd_on) fall_snd_on = 1;
+    if (!on_ground && vy > 512 && !jumping && !fall_snd_on) {
+        fall_snd_on = 1;
+        sfx_play(SND_PLUMMET);
+    }
 
     /* deadly tiles: direct cell fetches (bounds-checked once) */
     if (py >= -4 && (unsigned int)(py + 20) < mapPH) {
@@ -933,13 +906,13 @@ static void player_update(unsigned int ks, unsigned int kp) {
             ovr_add(it_mx[i], it_my[i], it_restore[i]);
             nt_update_cell(it_mx[i], it_my[i]);
             add_score(k);
-            if (k == K_AMMO)      { inv_ammo += 5; sfx_play(SFX_KEYCARD); }
-            else if (k == K_POGO) { inv_pogo = 1;  sfx_play(SFX_KEYCARD); }
+            if (k == K_AMMO)      { inv_ammo += 5; sfx_play(SND_ITEM); }
+            else if (k == K_POGO) { inv_pogo = 1;  sfx_play(SND_ITEM); }
             else if (k >= K_CARDY && k <= K_CARDB)
-                { inv_keys |= 1 << (k - K_CARDY); sfx_play(SFX_KEYCARD); }
+                { inv_keys |= 1 << (k - K_CARDY); sfx_play(SND_CARD); }
             else if (k >= K_JOYSTICK)
-                { inv_parts |= 1 << (k - K_JOYSTICK); sfx_play(SFX_EXIT); }
-            else sfx_play(SFX_COLLECT);
+                { inv_parts |= 1 << (k - K_JOYSTICK); sfx_play(SND_PART); }
+            else sfx_play(SND_BONUS);
         }
     }
     }
@@ -951,7 +924,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
         for (i = 0; i < n_exits; i++)
             if (ex_mx[i] == ecx && (ex_my[i] == ecy || ex_my[i] == ecy + 1)) {
                 exiting = 1; seq_timer = 0;
-                sfx_play(SFX_EXIT);
+                sfx_play(SND_LVLDONE);
                 break;
             }
     }
@@ -973,7 +946,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
                         ovr_add(do_mx[j], do_my[j], do_restore[j]);
                         nt_update_cell(do_mx[j], do_my[j]);
                     }
-                sfx_play(SFX_KEYCARD);
+                sfx_play(SND_DOOR);
             }
             break;
         }
@@ -1011,7 +984,7 @@ static void bullet_update(void) {
     if (mflag(b_px + 8, b_py + 4) & F_SOLID) {
         b_hit = 1; b_timer = 0;
         rng = rng * 13 + 7;
-        sfx_play(SFX_ZAP);
+        sfx_play(SND_SHOTHIT);
         return;
     }
     /* entities */
@@ -1020,11 +993,14 @@ static void bullet_update(void) {
         if (b_px + 12 >= y_px[i] && b_px + 4 <= y_px[i] + 15 &&
             b_py + 6  >= y_py[i] && b_py + 2 <= y_py[i] + 23) {
             b_hit = 1; b_timer = 0;
-            sfx_play(SFX_ZAP);
+            sfx_play(SND_SHOTHIT);
             if (e_type[i] == ET_TANK || e_type[i] == ET_BUTLER)
                 return;                          /* armored: zap absorbed */
             if (y_hp[i] > 1) { y_hp[i]--; return; }
             y_state[i] = 2; y_t[i] = 0;
+            sfx_play((e_type[i] == ET_YORP) ? SND_YORPSCREAM :
+                     (e_type[i] == ET_GARG) ? SND_GARGSCREAM :
+                                              SND_VORTSCREAM);
             add_score(0);
             return;
         }
@@ -1142,6 +1118,7 @@ static void ent_update(unsigned char i) {
         if (++y_t[i] > 110) {
             unsigned char v = t - ET_CANNON0;
             y_t[i] = 0;
+            sfx_play(SND_CANNON);
             spawn_proj(1, y_px[i], y_py[i] + 8,
                        (int)cvx[v] * 384, (int)cvy[v] * 384);
         }
@@ -1179,10 +1156,10 @@ static void ent_update(unsigned char i) {
             if (vy > 0 && py + 24 <= y_py[i] + 10) {
                 y_state[i] = 1; y_t[i] = 0;
                 vy = -400; pogoing = 0;
-                sfx_play(SFX_BUMP);
+                sfx_play(SND_YORPBOP);
             } else {
                 vx = (px < y_px[i]) ? -600 : 600;
-                sfx_play(SFX_BUMP);
+                sfx_play(SND_YORPBUMP);
             }
         }
         if (y_vx[i] > 0)      y_frame[i] = 6 + ((y_hop[i] >> 3) & 1);
@@ -1233,7 +1210,7 @@ static void ent_update(unsigned char i) {
         ent_move(i, 1);
         if (!dying && player_overlap(i)) {
             vx = (px < y_px[i]) ? -700 : 700;
-            sfx_play(SFX_BUMP);
+            sfx_play(SND_YORPBUMP);
         }
         y_hop[i]++;
         y_frame[i] = ((y_vx[i] > 0) ? 0 : 2) + ((y_hop[i] >> 3) & 1);
@@ -1247,7 +1224,7 @@ static void ent_update(unsigned char i) {
                 unsigned char right = (px > y_px[i]);
                 spawn_proj(2, y_px[i] + (right ? 14 : -14), y_py[i] + 10,
                            right ? 512 : -512, 0);
-                nfx_play(NFX_SHOOT);
+                sfx_play(SND_TANKFIRE);
                 y_hop[i] = right ? 1 : 0;
             }
         } else {
@@ -1259,7 +1236,7 @@ static void ent_update(unsigned char i) {
         ent_move(i, 1);
         if (!dying && player_overlap(i)) {
             vx = (px < y_px[i]) ? -700 : 700;
-            sfx_play(SFX_BUMP);
+            sfx_play(SND_YORPBUMP);
         }
         y_hop[i] = (y_vx[i] > 0) ? 1 : ((y_vx[i] < 0) ? 0 : y_hop[i]);
         y_frame[i] = ((y_hop[i] & 1) ? 0 : 2) + ((unsigned char)y_px[i] >> 3 & 1);
@@ -1283,7 +1260,7 @@ static void proj_update(void) {
         if (!dying &&
             nx + 12 >= px + 3 && nx + 4 <= px + 12 &&
             ny + 8  >= py + 2 && ny     <= py + 22) {
-            if (pj_on[i] == 1) { stun_t = 90; sfx_play(SFX_BUMP); }
+            if (pj_on[i] == 1) { stun_t = 90; sfx_play(SND_KEENCICLE); }
             else player_die();
             pj_on[i] = 0;
         }
@@ -1562,7 +1539,10 @@ static void run_overworld(void) {
         else if (ks & PORT_A_KEY_RIGHT) { if (!ow_blocked(px + 2, py)) px += 2; ow_dir = 1; ow_moving = 1; }
         if (ks & PORT_A_KEY_UP)    { if (!ow_blocked(px, py - 2)) py -= 2; ow_dir = 2; ow_moving = 1; }
         else if (ks & PORT_A_KEY_DOWN) { if (!ow_blocked(px, py + 2)) py += 2; ow_dir = 0; ow_moving = 1; }
-        if (ow_moving) anim_t++;
+        if (ow_moving) {
+            anim_t++;
+            if (!(anim_t & 7)) sfx_play(SND_WLDWALK);
+        }
         if (px < 0) px = 0; if (py < 0) py = 0;
         if (px > (int)mapPW - 16) px = (int)mapPW - 16;
         if (py > (int)mapPH - 16) py = (int)mapPH - 16;
@@ -1573,7 +1553,7 @@ static void run_overworld(void) {
             unsigned char pcy = (unsigned char)((unsigned int)(py + 8) >> 4);
             for (i = 0; i < n_teleports; i++) {
                 if (tp_sx[i] != pcx || tp_sy[i] != pcy) continue;
-                sfx_play(SFX_ENTER);
+                sfx_play(SND_TELEPORT);
                 /* warp: place Keen on the destination cell, snap camera */
                 px = (int)tp_dx[i] << 4;
                 py = (int)tp_dy[i] << 4;
@@ -1598,7 +1578,7 @@ static void run_overworld(void) {
             for (i = 0; i < n_entries; i++) {
                 if (en_mx[i] != pcx || en_my[i] != pcy) continue;
                 if (level_done[en_lvl[i]]) break;      /* done: no re-entry */
-                sfx_play(SFX_ENTER);
+                sfx_play(SND_GOINDOOR);
                 wait_frames(30);
                 cur_level = en_lvl[i];
                 {
@@ -1633,7 +1613,7 @@ static void run_win(void) {
     print_at(6, 18, "FINAL SCORE");
     print_num(18, 18, score_hi, score_lo);
     SMS_displayOn();
-    sfx_play(SFX_EXIT);
+    sfx_play(SND_LVLDONE);
     wait_frames(480);
     /* fresh game state for another run */
     {
