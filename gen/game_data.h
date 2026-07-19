@@ -23,6 +23,40 @@ typedef struct {
 extern const LevelDesc level_descs[17];
 extern const unsigned char bg_palette[16], spr_palette[16];
 extern const unsigned char font_1bpp[472];
+#define SND_WALK1 0
+#define SND_WALK2 1
+#define SND_WLDWALK 2
+#define SND_BLOK 3
+#define SND_JUMP 4
+#define SND_LAND 5
+#define SND_POGO 6
+#define SND_POGOJUMP 7
+#define SND_BUMPHEAD 8
+#define SND_DIE 9
+#define SND_FIRE 10
+#define SND_GUNCLICK 11
+#define SND_BONUS 12
+#define SND_ITEM 13
+#define SND_PART 14
+#define SND_CARD 15
+#define SND_DOOR 16
+#define SND_LVLDONE 17
+#define SND_WLDENTER 18
+#define SND_GOINDOOR 19
+#define SND_TELEPORT 20
+#define SND_SHOTHIT 21
+#define SND_YORPBOP 22
+#define SND_YORPSCREAM 23
+#define SND_GARGSCREAM 24
+#define SND_VORTSCREAM 25
+#define SND_KEENCICLE 26
+#define SND_YORPBUMP 27
+#define SND_TANKFIRE 28
+#define SND_CANNON 29
+#define SND_PLUMMET 30
+extern const unsigned int snd_data[];
+extern const unsigned int snd_off[];
+extern const unsigned char snd_pri[];
 extern const unsigned char spr_keen[],spr_yorp[],spr_owk[],spr_blt[],spr_garg[],spr_vort[],spr_butler[],spr_tank[],spr_eray[],spr_chunk[];
 extern const unsigned char title_tiles[];
 extern const unsigned int title_map[], title_ntiles;

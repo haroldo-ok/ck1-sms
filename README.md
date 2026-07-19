@@ -65,8 +65,9 @@ make           # -> keen.sms
 * **EGA sprites** — `EGASPRIT` stores each sprite as four colour planes
   plus a mask plane (bit set = transparent), each plane one continuous
   bitstream across all sprites, described by an `EGAHEAD` table (whose
-  records repeat four times). The garg, vorticon, robot guard, tank,
-  enemy ray and ice-chunk art are cut straight from it. One decoder
+  records repeat four times). The yorp, garg, vorticon, robot guard,
+  tank, enemy ray and ice-chunk art are all cut straight from it
+  (all enemies come from the original data files). One decoder
   subtlety cost a lot of debugging: at 12-bit codes Keen's LZW still
   defines dictionary entry 4095 (adding stops only at 4096); stopping one
   entry early makes code 4095 decode to an empty string, silently
@@ -152,7 +153,21 @@ banks 4-13  the 17 maps (16 levels + world), tile pools + map data, auto-packed
   row-bucketed so scroll strips look up a cell's override in O(row
   entries) — with 100+ items collected a naive full-list scan per cell
   used to blow entire frames on every scrolled column.
-* **Physics** — 8.8 fixed point (walk 2.25 px/f, gravity ≈0.15, jump −4,
+* **Sound** — all effects are the ORIGINAL PC-speaker sounds converted
+  from `SOUNDS.CK1` (word at 0x06 = count; 16-byte directory entries
+  from 0x10 with data offset, priority and a 12-char name; data = 16-bit
+  words where 0 is a silent tick, 0xFFFF ends the sound, and any other
+  value is a PC timer divisor). The SMS PSG clock is exactly 3x the PC
+  timer clock, so each divisor converts to a PSG tone period as
+  `word * 3 / 32`. Playback advances at the original ~44 values/sec
+  (44 ticks per 60 frames via an accumulator) on one tone channel, with
+  the original priority rule: a new sound only replaces the current one
+  if its priority is at least as high. 31 sounds are wired up: jump,
+  land, pogo bounce, high pogo jump, head bump, walk ticks, wall block,
+  fire, empty-gun click, all pickups, doors, level jingles, teleporter,
+  shot hits, the three enemy screams, yorp bop and shove, tank and
+  cannon fire, the freeze hit, plummet and death.
+* **Physics (pogo per the original)** — 8.8 fixed point (walk 2.25 px/f, gravity ≈0.15, jump −4,
   pogo with squat + auto-bounce and air steering, 14-frame shoot freeze).
 * **Input** — button edges are detected in the game loop against its own
   previous sample (not `SMS_getKeysPressed`, whose ISR-side edge pair can
@@ -193,6 +208,13 @@ cosmetic or minor gameplay:
 * `tools/seamtest.py` — scrolls the camera up repeatedly in level 1 and
   verifies the top visible name-table row always matches the map before the
   scroll register reveals it (guards against the vertical "loading seam").
+* `tools/sndtest.py` — captures PSG port writes during a jump and
+  verifies the emitted tone periods match the KEENJUMPSND data converted
+  from `SOUNDS.CK1`, including the priority interruption when Keen bumps
+  his head.
+* `tools/pogotest.py` — verifies the three vertical impulses (jump
+  -1024, pogo bounce -980 ~= 0.92x jump height, held-jump pogo -1474 ~=
+  2.07x jump height, calibrated from CloneKeen's jump model).
 * `tools/vblanktest.py` — jump-runs through level 13 and measures, on
   every non-overrun frame, how long the engine's VBlank section takes
   (SAT copy + scroll + art streaming + strip blits); fails if any frame

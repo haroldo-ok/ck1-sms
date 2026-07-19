@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Convert original Commander Keen 1 data (user-supplied CK1 files) into the
 SMS engine's gen/ banks: all 16 levels + the Mars world map, EGA enemy
-sprites, plus the existing HTML5-derived Keen/yorp art, title and font.
+sprites, plus the HTML5-derived Keen art, title and font (all enemies come
+from EGASPRIT, all sounds from SOUNDS.CK1).
 
 Simplifications (documented in README):
   - background tile animation dropped (first frame used)
@@ -273,7 +274,9 @@ for lv in sorted(levels, key=lambda l: -(len(l['tiles']))):
 keen_g = img_to_ega(load_rgba(HTML+'/sprites/keen.png'), True)
 owk_g  = img_to_ega(load_rgba(HTML+'/sprites/keen_overworld.png'), True)
 blt_g  = img_to_ega(load_rgba(HTML+'/sprites/bullet.png'), True)
-yorp_g = img_to_ega(load_rgba(HTML+'/sprites/enemies/yorp.png'), True)
+# yorp straight from EGASPRIT, ordered to match the engine's frame
+# semantics (look x4, walk R x2, walk L x2, stun x2, zapped, dead)
+YORP_F = [48, 49, 50, 51, 54, 55, 52, 53, 56, 57, 58, 59]
 
 def ega_frame(si, w=16, h=24):
     """EGASPRIT sprite -> w x h grid, center-cropped x, bottom-anchored y"""
@@ -305,16 +308,14 @@ tank_frames   = [ega_frame(i) for i in TANK_F]
 eray_frame    = ega_frame(109, 16, 8)        # green enemy zap
 chunk_frame   = ega_frame(112, 16, 16)       # the flying ice cube
 
-allspr = [keen_g, owk_g, blt_g, yorp_g] + garg_frames + vort_frames + \
+yorp_frames   = [ega_frame(i) for i in YORP_F]
+allspr = [keen_g, owk_g, blt_g] + yorp_frames + garg_frames + vort_frames + \
          butler_frames + tank_frames + [eray_frame, chunk_frame]
 ega2slot, SPR_PAL = build_sprite_palette(allspr)
 
 spr_keen = b''
 for f in range(28):
     spr_keen += sprite_frame_tiles(keen_g, (f%6)*16, (f//6)*24, 2, 3, ega2slot)
-spr_yorp = b''
-for f in range(12):
-    spr_yorp += sprite_frame_tiles(yorp_g, f*16, 0, 2, 3, ega2slot)
 spr_owk = b''
 for f in range(16):
     cx, cy = (f%8)*12, (f//8)*17 if load_rgba(HTML+'/sprites/keen_overworld.png').size[1] >= 34 else (f//8)*16
@@ -338,6 +339,7 @@ def frames_blob(frames):
         out += sprite_frame_tiles(g, 0, 0, 2, h//8, ega2slot)
     return out
 
+spr_yorp   = frames_blob(yorp_frames)        # 12 x 6 tiles
 spr_garg   = frames_blob(garg_frames)        # 5 x 6 tiles
 spr_vort   = frames_blob(vort_frames)        # 6 x 6
 spr_butler = frames_blob([  # pad 16x16 to 16x24 bottom-anchored
@@ -425,6 +427,65 @@ for b in sorted(banks):
                 for (sx,sy,dx,dy) in lv['teleports']: tp += [sx,sy,dx,dy]
                 carr(f, p+'_teleports', bytes(tp) or b'\0')
 
+# ------------------------------------------------- PC speaker sounds -----
+# SOUNDS.CK1: word at 0x06 = sound count; 16-byte directory entries from
+# 0x10 (word data-offset, byte priority, pad, 12-char name); sound data =
+# 16-bit words: 0 = silence tick, 0xFFFF = end, else a PIT divisor
+# (frequency = 1193180 / word).  The SMS PSG clock is exactly 3x the PIT
+# clock, so the PSG tone period is simply word * 3 / 32.
+SND_SEL = [
+    ('KEENWALKSND', 'WALK1'),    ('KEENWLK2SND', 'WALK2'),
+    ('WLDWALKSND',  'WLDWALK'),  ('KEENBLOKSND', 'BLOK'),
+    ('KEENJUMPSND', 'JUMP'),     ('KEENLANDSND', 'LAND'),
+    ('KEENPOGOSND', 'POGO'),     ('POGOJUMPSND', 'POGOJUMP'),
+    ('BUMPHEADSND', 'BUMPHEAD'), ('KEENDIESND',  'DIE'),
+    ('KEENFIRESND', 'FIRE'),     ('GUNCLICK',    'GUNCLICK'),
+    ('GOTBONUSSND', 'BONUS'),    ('GOTITEMSND',  'ITEM'),
+    ('GOTPARTSND',  'PART'),     ('GETCARDSND',  'CARD'),
+    ('DOOROPENSND', 'DOOR'),     ('LVLDONESND',  'LVLDONE'),
+    ('WLDENTERSND', 'WLDENTER'), ('GOINDOORSND', 'GOINDOOR'),
+    ('TELEPORTSND', 'TELEPORT'), ('SHOTHIT',     'SHOTHIT'),
+    ('YORPBOPSND',  'YORPBOP'),  ('YORPSCREAM',  'YORPSCREAM'),
+    ('GARGSCREAM',  'GARGSCREAM'), ('vortscream', 'VORTSCREAM'),
+    ('keencicle',   'KEENCICLE'), ('YORPBUMPSND', 'YORPBUMP'),
+    ('TANKFIRE',    'TANKFIRE'),  ('CANNONFIRE',  'CANNON'),  ('PLUMMETSND',  'PLUMMET'),
+]
+
+def load_ck1_sounds(path):
+    import struct
+    d = open(path, 'rb').read()
+    n = struct.unpack_from('<H', d, 6)[0]
+    out = {}
+    for j in range(n):
+        off, pri = struct.unpack_from('<HB', d, 0x10 + j*16)
+        name = d[0x10+j*16+4:0x10+j*16+16].split(b'\0')[0].decode('ascii', 'replace')
+        words = []
+        p = off
+        while p + 1 < len(d):
+            v = struct.unpack_from('<H', d, p)[0]; p += 2
+            if v == 0xFFFF: break
+            words.append(v)
+        out[name] = (pri, words)
+    return out
+
+_snds = load_ck1_sounds(CK + '/SOUNDS.CK1')
+snd_data, snd_off, snd_pri = [], [], []
+for fname, cname in SND_SEL:
+    pri, words = _snds[fname]
+    snd_off.append(len(snd_data))
+    snd_pri.append(pri)
+    for w in words:
+        if w == 0:
+            snd_data.append(0)
+        else:
+            p = (w * 3 + 16) >> 5
+            if p < 1: p = 1
+            if p > 1023: p = 1023
+            snd_data.append(p)
+    snd_data.append(0xFFFF)
+print('sounds: %d selected, %d words (%d bytes)'
+      % (len(SND_SEL), len(snd_data), len(snd_data)*2))
+
 with open(os.path.join(GEN,'game_data.h'), 'w') as f:
     f.write('#ifndef GAME_DATA_H\n#define GAME_DATA_H\n')
     f.write('#define F_SOLID  1\n#define F_PLAT   2\n#define F_DEADLY 4\n')
@@ -447,6 +508,11 @@ with open(os.path.join(GEN,'game_data.h'), 'w') as f:
     f.write('extern const LevelDesc level_descs[17];\n')
     f.write('extern const unsigned char bg_palette[16], spr_palette[16];\n')
     f.write('extern const unsigned char font_1bpp[%d];\n' % len(font_1bpp))
+    for k, (_, cname) in enumerate(SND_SEL):
+        f.write('#define SND_%s %d\n' % (cname, k))
+    f.write('extern const unsigned int snd_data[];\n')
+    f.write('extern const unsigned int snd_off[];\n')
+    f.write('extern const unsigned char snd_pri[];\n')
     f.write('extern const unsigned char spr_keen[],spr_yorp[],spr_owk[],'
             'spr_blt[],spr_garg[],spr_vort[],spr_butler[],spr_tank[],'
             'spr_eray[],spr_chunk[];\n')
@@ -463,6 +529,14 @@ with open(os.path.join(GEN,'game_data.h'), 'w') as f:
 
 with open(os.path.join(GEN,'game_data.c'), 'w') as f:
     f.write('#include "game_data.h"\n')
+    f.write('const unsigned int snd_data[%d] = {\n' % len(snd_data))
+    for i in range(0, len(snd_data), 16):
+        f.write('  ' + ','.join(str(x) for x in snd_data[i:i+16]) + ',\n')
+    f.write('};\n')
+    f.write('const unsigned int snd_off[%d] = { %s };\n'
+            % (len(snd_off), ','.join(str(x) for x in snd_off)))
+    f.write('const unsigned char snd_pri[%d] = { %s };\n'
+            % (len(snd_pri), ','.join(str(x) for x in snd_pri)))
     carr(f, 'bg_palette', bytes(BG_PAL))
     carr(f, 'spr_palette', bytes(SPR_PAL))
     carr(f, 'font_1bpp', bytes(font_1bpp))
