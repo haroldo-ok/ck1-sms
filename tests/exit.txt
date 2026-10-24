@@ -1,0 +1,26 @@
+symbols keen.noi
+run 420
+tap 1
+run 200
+poke px 400 s16
+poke py 624 s16
+run 10
+hold left
+waituntil game_state == 2 120 w1
+hold none
+run 150
+poke px 1790 s16
+poke py 120 s16
+poke vy 0 s16
+hold right
+run 40
+hold none
+print exiting w1
+print py s16
+screenshot shots/exit1.ppm
+waituntil game_state == 1 300 w1
+run 100
+print level_done w1
+print px s16
+print py s16
+screenshot shots/exit2.ppm

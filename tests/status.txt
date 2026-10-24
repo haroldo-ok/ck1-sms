@@ -1,0 +1,19 @@
+symbols keen.noi
+run 60
+tap 1
+run 200
+poke inv_parts 5 w1
+poke inv_pogo 1 w1
+poke inv_ammo 12 w1
+poke score_lo 4321 w2
+echo === pause -> status
+pause
+run 60
+screenshot shots/status.ppm
+tap 1
+run 30
+echo === ship box at the ship
+poke px 192 s16
+poke py 624 s16
+run 30
+screenshot shots/ship.ppm

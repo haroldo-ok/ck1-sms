@@ -1,0 +1,31 @@
+symbols keen.noi
+run 60
+tap 1
+run 200
+echo === enter level 1
+poke cur_level 1 w1
+poke game_state 2 w1
+run 150
+expect cur_level == 1 w1
+screenshot shots/l1_start.ppm
+print px s16
+print py s16
+echo === walk right
+hold right
+run 60
+hold none
+print px s16
+run 30
+echo === full jump (hold)
+poke inv_pogo 0 w1
+hold 1
+run 8
+print jprep w1
+print py s16
+run 40
+print on_ground w1
+print py s16
+hold none
+run 60
+print py s16
+screenshot shots/l1_jump.ppm

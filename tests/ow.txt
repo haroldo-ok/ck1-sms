@@ -1,0 +1,14 @@
+symbols keen.noi
+run 60
+tap 1
+run 200
+poke inv_parts 5 w1
+poke inv_pogo 1 w1
+poke inv_ammo 12 w1
+echo === die -> keens left box
+poke game_state 4 w1
+run 100
+screenshot shots/keensleft.ppm
+tap 1
+run 60
+screenshot shots/ow_after.ppm

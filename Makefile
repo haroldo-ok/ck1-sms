@@ -15,7 +15,6 @@ CRT0     := crt0_sms.rel
 PROG     := keen
 
 include gen/banks.mk
-BANKRELS := $(addprefix build/bank,$(addsuffix .rel,$(BANKS)))
 
 CFLAGS   := -mz80 --peep-file $(SMSLIB)/peep-rules.txt -I$(SMSLIB) -Igen
 LDFLAGS  := -mz80 --no-std-crt0 --data-loc 0xC000 $(BANKFLAGS)
@@ -33,9 +32,14 @@ build/game_data.rel: gen/game_data.c gen/game_data.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
-build/bank%.rel: gen/bank%.c
+$(addprefix build/bank,$(addsuffix .rel,$(DATABANKS))): build/bank%.rel: gen/bank%.c
 	@mkdir -p build
 	$(CC) -mz80 --constseg BANK$* -c $< -o $@
+
+# code overlays: compiled into their own slot-2 bank (see src/engine.h)
+build/ovl_%.rel: src/ovl_%.c src/engine.h gen/game_data.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) --codeseg BANK$(OVL_$*) --constseg BANK$(OVL_$*) -c $< -o $@
 
 $(PROG).ihx: build/main.rel build/game_data.rel $(BANKRELS)
 	$(CC) -o $@ $(LDFLAGS) $(CRT0) build/main.rel build/game_data.rel $(SMSLIB)/SMSlib.lib $(BANKRELS)

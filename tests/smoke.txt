@@ -1,0 +1,11 @@
+symbols keen.noi
+run 120
+expectvdp display 1
+screenshot shots/title.ppm
+tap 1
+run 200
+screenshot shots/world.ppm
+hold right
+run 40
+hold none
+screenshot shots/world2.ppm

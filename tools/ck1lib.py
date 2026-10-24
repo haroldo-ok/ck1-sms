@@ -207,3 +207,111 @@ def load_level(path):
             spawn = (i % W, i // W)
             objmap[i] = 0
     return dict(W=W, H=H, tiles=tilemap, objs=objmap, spawn=spawn)
+
+# ------------------------------------------------- latch: 8x8 tiles/bitmaps -
+def _latch_raw(latch_path, hdr):
+    raw = open(latch_path, 'rb').read()
+    size = hdr['LatchPlaneSize'] * 4
+    if hdr['Compressed']:
+        raw = lzw_decompress(raw[6:], size)
+    else:
+        raw = raw[:size]
+    return raw
+
+def load_latch_tiles8(latch_path, hdr):
+    """256 8x8 tiles (the font + HUD chars), planar 4bpp -> pixel rows."""
+    raw = _latch_raw(latch_path, hdr)
+    ps = hdr['LatchPlaneSize']
+    base = hdr['Off8Tiles']
+    out = []
+    for t in range(hdr['Num8Tiles']):
+        px = [[0]*8 for _ in range(8)]
+        for p in range(4):
+            for y in range(8):
+                b = raw[base + p*ps + t*8 + y]
+                for x in range(8):
+                    if b & (0x80 >> x): px[y][x] |= 1 << p
+        out.append(px)
+    return out
+
+def load_bitmaps(latch_path, hdr):
+    """EGALATCH bitmaps -> {name: pixel rows}. Each is planar, one plane
+    after another (w/8*h bytes each) relative to OffBitmaps."""
+    raw = _latch_raw(latch_path, hdr)
+    ps = hdr['LatchPlaneSize']
+    d = hdr['raw']
+    o = hdr['OffBitmapTable']
+    out = {}
+    for i in range(hdr['NumBitmaps']):
+        w8, h = struct.unpack_from('<HH', d, o + i*16)[0:2]
+        loc, = struct.unpack_from('<L', d, o + i*16 + 4)
+        name = d[o+i*16+8:o+i*16+16].split(b'\0')[0].decode('ascii')
+        w = w8 * 8
+        px = [[0]*w for _ in range(h)]
+        for p in range(4):
+            base = hdr['OffBitmaps'] + p*ps + loc
+            for y in range(h):
+                for xb in range(w8):
+                    b = raw[base + y*w8 + xb]
+                    for k in range(8):
+                        if b & (0x80 >> k): px[y][xb*8+k] |= 1 << p
+        out[name] = px
+    return out
+
+# --------------------------------------------------------- finale screens --
+def load_finale(path):
+    """FINALE.CK1 / PREVIEW2.CK1 / PREVIEW3.CK1: RLE-compressed planar
+    320x200 EGA image (planes 1,2,4,8 in order, each 8000 bytes)."""
+    d = open(path, 'rb').read()
+    plane_len = struct.unpack_from('<L', d, 0)[0] * 2     # in bits
+    pos = 4
+    bits = []
+    def emit(byte):
+        for k in range(8): bits.append((byte >> (7-k)) & 1)
+    total = plane_len * 4
+    while len(bits) < total and pos < len(d):
+        c = d[pos]; pos += 1
+        if c & 0x80:
+            n = (c & 0x7f) + 1
+            for _ in range(n):
+                emit(d[pos]); pos += 1
+        else:
+            n = c + 3
+            v = d[pos]; pos += 1
+            for _ in range(n): emit(v)
+    W, H = 320, 200
+    img = [[0]*W for _ in range(H)]
+    for p in range(4):
+        for i in range(plane_len):
+            if i + p*plane_len >= len(bits): break
+            if i >= W*H: break
+            if bits[i + p*plane_len]:
+                img[i // W][i % W] |= 1 << p
+    return img
+
+# --------------------------------------------------------------- unlzexe ---
+def exe_image(path):
+    sys_path = os.path.dirname(os.path.abspath(__file__))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('unlzexe', os.path.join(sys_path, 'unlzexe.py'))
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    return m.unpack(path)[1]
+
+def exe_tileinfo(img, off=0x130F8, n=611):
+    """CG's Vorticon tile-info block: 6 planes of n words:
+    anim, behaviour, bup, bright, bdown, bleft."""
+    w = struct.unpack_from('<%dh' % (6*n), img, off)
+    return [dict(anim=w[i], beh=w[n+i], bup=w[2*n+i], bright=w[3*n+i],
+                 bdown=w[4*n+i], bleft=w[5*n+i]) for i in range(n)]
+
+
+def exe_string(img, start, end, off=-512):
+    """CG-compatible string extraction: 0x0A may be followed by a 0 pad byte"""
+    out = bytearray(); pos = start + off; end += off
+    while pos < end:
+        while img[pos] == 0x0A:
+            out.append(0x0A); pos += 1
+            if img[pos] == 0: pos += 1
+        if img[pos] == 0: break
+        out.append(img[pos]); pos += 1
+    return out.decode('latin-1')

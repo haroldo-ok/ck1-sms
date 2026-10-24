@@ -24,33 +24,41 @@
 
 #include "SMSlib.h"
 #include "game_data.h"
+#include "engine.h"
 
 __sfr __at 0x7F PSGPort;
 
+/* slot-2 bank shadow: code that temporarily maps another bank (sound data
+   fetches) restores whatever the main code had mapped */
+unsigned char b2_shadow;
+static void map2(unsigned char b) { b2_shadow = b; SMS_mapROMBank(b); }
+
 /* ---------------------------------------------------------------- consts -- */
-#define STATE_TITLE  0
-#define STATE_OW     1
-#define STATE_LEVEL  2
-#define STATE_WIN    3
 
 /* VRAM sprite tile slots (absolute tile numbers; pass n-256 to addSprite) */
 #define VT_PLAYER   256            /* 6 tiles, streamed every frame          */
-#define VT_SLOT0    262            /* 8 x 6 tiles, entity streaming slots    */
-#define VT_BULLET   312            /* 12 tiles, loaded once per level        */
-#define VT_ERAY     324            /* 2 tiles, enemy ray                     */
-#define VT_CHUNK    326            /* 4 tiles, ice chunk                     */
+#define VT_SLOT0    262            /* 7 x 12 tiles, entity streaming slots   */
+#define VT_BULLET   346            /* 12 tiles, loaded once per level        */
+#define VT_ERAY     358            /* 2 tiles, enemy ray                     */
+#define VT_CHUNK    360            /* 4 tiles, ice chunk                     */
+#define VT_SHIP     364            /* 8 tiles, ending ship + ?/! marks        */
 #define VT_OWKEEN   444            /* 4 tiles, overworld player              */
-#define N_SLOTS     8
+#define N_SLOTS     7
 
 /* physics, 8.8 fixed point (units: 1/256 px per frame) */
+/* values are Commander Genius' vorticon-engine constants (px/frame * 32 =
+   its units; here 8.8 so units * 8): max jump 120, up-decel 4, fall accel
+   8 after the apex, terminal 104, walk 68, air steer 3 per frame */
 #define WALK_ACC     96
-#define WALK_MAX    576
-#define AIR_ACC      96
-#define GRAV         38
-#define JUMP_V    (-1024)
-#define POGO_LO_V  (-980)    /* pogo bounce  ~= 0.92x max-jump height   */
-#define POGO_HI_V (-1474)    /* held-jump pogo ~= 2.07x max-jump height */
-#define FALL_MAX   1024
+#define WALK_MAX    544
+#define AIR_ACC      24
+#define GRAV_UP      32     /* rising deceleration                      */
+#define GRAV_DN      64     /* acceleration after the apex              */
+#define GRAV_WALKOFF 32     /* walking off a ledge: 1px/f start + 4*8   */
+#define JUMP_V     (-960)   /* full-height jump                         */
+#define POGO_LO_V  (-960)   /* low pogo bounce = a normal jump          */
+#define POGO_HI_V (-1450)   /* held-jump pogo (1.1 * 165 * 8)           */
+#define FALL_MAX    832
 #define POGO_STEER   77
 #define BULLET_V    640
 
@@ -59,7 +67,6 @@ __sfr __at 0x7F PSGPort;
 #define MAX_DOORS    8
 #define MAX_ENTRIES 48
 #define MAX_EXITS    4
-#define NLEVELS     17
 
 /* item kinds (must match tools/convert_ck1.py) */
 #define K_PTS100  0
@@ -82,18 +89,18 @@ __sfr __at 0x7F PSGPort;
 /* keen sprite-sheet frame ids (16x24 frames, 6 per row) */
 #define KF_STAND_R  0
 #define KF_WALK_R   1     /* 1..3 */
-#define KF_POGO_DN_R 4
-#define KF_POGO_UP_R 5
-#define KF_STAND_L  6
-#define KF_WALK_L   7     /* 7..9 */
-#define KF_POGO_DN_L 10
-#define KF_POGO_UP_L 11
-#define KF_FALL_R   17
-#define KF_FALL_L   23
-#define KF_SHOOT_R  24
-#define KF_SHOOT_L  25
-#define KF_DIE0     26
-#define KF_DIE1     27
+#define KF_STAND_L  4
+#define KF_WALK_L   5     /* 5..7 */
+#define KF_FALL_R   13
+#define KF_FALL_L   19
+#define KF_SHOOT_R  20
+#define KF_SHOOT_L  21
+#define KF_DIE0     22
+#define KF_DIE1     23
+#define KF_POGO_UP_R 24
+#define KF_POGO_DN_R 25
+#define KF_POGO_UP_L 26
+#define KF_POGO_DN_L 27
 
 /* yorp frames */
 #define YF_LOOK0    1
@@ -103,19 +110,30 @@ __sfr __at 0x7F PSGPort;
 #define YF_DIE      10
 #define YF_DEAD     11
 
+#define F_ANY (F_UP | F_CEIL | F_BLKR | F_BLKL)
+
 /* ---------------------------------------------------------------- state --- */
 static const LevelDesc *ld;
 unsigned char cur_level;                /* 0=overworld 1..3 */
 unsigned char game_state;
 unsigned char level_done[NLEVELS];
-static unsigned int  score_hi;          /* score = hi*10000 + lo (BCD-ish)   */
-static unsigned int  score_lo;
+unsigned int  score_hi;          /* score = hi*10000 + lo (BCD-ish)   */
+unsigned int  score_lo;
 
 /* inventory */
-static unsigned char inv_ammo, inv_pogo;
-static unsigned char inv_keys;          /* bit 0..3 = card Y R G B, per level */
+unsigned char inv_ammo, inv_pogo;
+unsigned char inv_keys;          /* bit 0..3 = card Y R G B, per level */
 unsigned char inv_parts;                /* bit 0..3 = joystick/battery/vacuum/fuel */
-static unsigned char stun_t;            /* icy-chunk stun timer */
+unsigned char lives = 3;
+unsigned int next_life = 2;      /* extra Keen every 20000 points (score_hi counts 10000s) */
+unsigned char stun_t;            /* frozen-in-ice timer */
+unsigned char jprep, jframe, jtimer, pogo_hold, parts_at_entry;
+unsigned char hint_used, tele_pending, show_lives;
+int ow_px = -1, ow_py;                /* where Keen entered the level (map checkpoint) */
+static const unsigned char hint_msg[17] =   /* level -> TXT_HINT* string id */
+    { 0, 0, TXT_HINT2, 0, 0, 0, TXT_HINT6, 0, 0, TXT_HINT9, TXT_HINT10,
+      TXT_HINT11, TXT_HINT12, 0, 0, TXT_HINT15, 0 };
+static const unsigned char walk_seq[4] = { 0, 1, 2, 1 };   /* frames 1,2,3,2 */
 
 /* map access (valid while ld->map_bank mapped) */
 static const unsigned char *map_rom;
@@ -182,10 +200,10 @@ static unsigned int pend_col_camr8;       /* row base captured with column   */
 
 /* player */
 int px, py;                             /* world pixel, sprite top-left      */
-static int  vx, vy;                     /* 8.8                               */
+int vx, vy;                     /* 8.8                               */
 static int  sx_acc, sy_acc;             /* subpixel accumulators             */
-static unsigned char dir_right, on_ground, jumping, pogoing, pogo_squat;
-static unsigned char shoot_timer, exiting, dying;
+unsigned char dir_right, on_ground, jumping, pogoing, pogo_squat;
+unsigned char shoot_timer, exiting, dying;
 static unsigned int  seq_timer;
 static unsigned char pframe, cur_pframe, anim_t;
 static unsigned char fall_snd_on;
@@ -214,6 +232,8 @@ static unsigned char  near_timer;         /* frames since last rebuild */
 static unsigned char  near_pg;            /* cam_pg at last rebuild */
 static unsigned char  slot_owner[N_SLOTS];
 static unsigned char  slot_vframe[N_SLOTS];
+static unsigned char  slot_part[N_SLOTS];     /* 12-tile art: 1 = first half loaded */
+static unsigned char  slot_pkey[N_SLOTS];
 
 /* projectiles: 2 ice chunks + 2 enemy rays */
 static unsigned char pj_on[4];            /* 0 off, 1 chunk, 2 eray */
@@ -229,7 +249,7 @@ static unsigned char anim_ph;           /* walk anim phase 0..2 */
 /* loop-side input edge detection: immune to ISR updates mid-frame
    (SMS_getKeysPressed loses edges whenever a game frame overruns and the
    ISR refreshes its previous/current pair before the loop reads it) */
-static unsigned int prev_ks;
+unsigned int prev_ks;
 static unsigned char jump_buf;          /* buffered jump press, frames */
 #define JUMP_BUF_FRAMES 5
 
@@ -256,7 +276,7 @@ static void psg_noise(unsigned char mode, unsigned char att) {
 }
 static void psg_noise_off(void) { PSGPort = 0xFF; }
 
-static void sfx_play(unsigned char id) {
+void sfx_play(unsigned char id) {
     unsigned char p = snd_pri[id];
     if (snd_on && p < snd_pri_cur) return;
     snd_p = snd_data + snd_off[id];
@@ -264,13 +284,16 @@ static void sfx_play(unsigned char id) {
     snd_acc = 60;                      /* first value fires immediately */
 }
 
-static void sfx_update(void) {
+void sfx_update(void) {
     if (!snd_on) return;
     snd_acc += 44;
     while (snd_acc >= 60) {
         unsigned int v;
         snd_acc -= 60;
-        v = *snd_p++;
+        { unsigned char ob = b2_shadow;
+          SMS_mapROMBank(BANK_SND);
+          v = *snd_p++;
+          SMS_mapROMBank(ob); }
         if (v == 0xFFFF) {
             psg_tone_off();
             snd_on = 0; snd_pri_cur = 0;
@@ -305,14 +328,14 @@ static unsigned char door_open_at(unsigned char cx, unsigned char cy) {
 }
 static unsigned char mflag(int wx, int wy) {
     unsigned int mx, my;
-    if (wx < 0 || wy < 0) return F_SOLID;
+    if (wx < 0 || wy < 0) return F_ANY;
     mx = (unsigned int)wx >> 4;
     my = (unsigned int)wy >> 4;
-    if (mx >= mapW) return F_SOLID;
+    if (mx >= mapW) return F_ANY;
     if (my >= mapH) return 0;
     {
         unsigned char f = flags_ram[map_rom[row_off[my] + mx]];
-        if ((f & F_SOLID) && n_open_doors &&
+        if ((f & F_ANY) && n_open_doors &&
             door_open_at((unsigned char)mx, (unsigned char)my))
             return 0;
         return f;
@@ -521,11 +544,62 @@ static void print_num(unsigned char x, unsigned char y, unsigned int hi, unsigne
     for (i = 0; i < 6; i++) { unsigned char c = numbuf[i]; SMS_setTile((unsigned int)(c - 32)); }
 }
 
-static const unsigned int kind_score[15] =
-    { 100, 200, 500, 1000, 5000, 0, 0, 500, 500, 500, 500, 0, 0, 0, 0 };
+static const unsigned int kind_score[15] =       /* ship parts: 10000; cards give none */
+    { 100, 200, 500, 1000, 5000, 0, 0, 0, 0, 0, 0, 10000, 10000, 10000, 10000 };
 static void add_score(unsigned char kind) {
     score_lo += kind_score[kind];
     while (score_lo >= 10000) { score_lo -= 10000; score_hi++; }
+    if (score_hi >= next_life) {                 /* extra Keen every 20000 */
+        next_life += 2;
+        if (lives < 9) lives++;
+        sfx_play(SND_EXTRAMAN);
+    }
+}
+
+/* ---- animated tiles: live subtiles re-streamed from the original's frame
+   cycle (see convert_ck1.py).  anim_scan() queues up to 6 stale tiles at
+   the end of a frame; anim_upload() sends them in a VBlank that carries no
+   other art burst. */
+#define MAX_ANIM 80
+static unsigned char an_cur[MAX_ANIM];
+unsigned char an_n, an_cursor, ab_n;
+static const unsigned char *an_list;
+static unsigned int ab_tile[6];
+static const unsigned char *ab_src[6];
+
+static void anim_init(void) {
+    unsigned char i;
+    an_list = ld->anim; an_n = ld->nanim;
+    if (an_n > MAX_ANIM) an_n = MAX_ANIM;
+    for (i = 0; i < an_n; i++) an_cur[i] = an_list[i * 4 + 3] & 3;
+    ab_n = 0; an_cursor = 0;
+}
+
+static void anim_scan(void) {
+    unsigned char i, k, ph, step;
+    const unsigned char *q;
+    if (!an_n || ab_n) return;
+    step = frame_ct >> 3;
+    i = an_cursor;
+    for (k = 0; k < an_n && ab_n < 6; k++) {
+        q = an_list + i * 4;
+        ph = (q[3] + step) & 3;
+        if (ph != an_cur[i]) {
+            an_cur[i] = ph;
+            ab_tile[ab_n] = q[0] | ((unsigned int)q[1] << 8);
+            ab_src[ab_n] = anim_art + (unsigned int)q[2] * 128 + ph * 32;
+            ab_n++;
+        }
+        if (++i >= an_n) i = 0;
+    }
+    an_cursor = i;
+}
+
+static void anim_upload(void) {
+    unsigned char k;
+    map2(BANK_SPR2);
+    for (k = 0; k < ab_n; k++) UNSAFE_SMS_loadNTiles(ab_src[k], ab_tile[k], 1);
+    ab_n = 0;
 }
 
 static void load_level(unsigned char lvl) {
@@ -549,19 +623,23 @@ static void load_level(unsigned char lvl) {
     SMS_VDPturnOnFeature(VDPFEATURE_LEFTCOLBLANK);
 
     /* BG tiles */
-    SMS_mapROMBank(ld->bank);
+    map2(ld->bank);
     SMS_loadTiles(ld->tiles, 0, ld->tiles_size);
 
     /* sprite art resident per level */
-    SMS_mapROMBank(BANK_SPRITES);
+    map2(BANK_SPRITES);
     if (lvl) {
         SMS_loadTiles(spr_blt, VT_BULLET, 12 * 32);
         SMS_loadTiles(spr_eray, VT_ERAY, 2 * 32);
         SMS_loadTiles(spr_chunk, VT_CHUNK, 4 * 32);
     }
+    if (lvl == LVL_FLY) {
+        map2(BANK_SPR2);
+        SMS_loadTiles(spr_ship, VT_SHIP, 8 * 32);
+    }
 
     /* map-side data */
-    SMS_mapROMBank(ld->map_bank);
+    map2(ld->map_bank);
     map_rom   = ld->map;
     mtdef_rom = ld->mtdef;
     for (i = 0; i < ld->nmt; i++) flags_ram[i] = ld->mtflags[i];
@@ -603,7 +681,7 @@ static void load_level(unsigned char lvl) {
         if (t == ET_YORP || t == ET_GARG) y_vx[i] = (i & 1) ? 128 : -128;
         if (t == ET_BUTLER || t == ET_TANK) y_vx[i] = (i & 1) ? 96 : -96;
     }
-    for (i = 0; i < N_SLOTS; i++) { slot_owner[i] = 0xFF; slot_vframe[i] = 0xFE; }
+    for (i = 0; i < N_SLOTS; i++) { slot_owner[i] = 0xFF; slot_vframe[i] = 0xFE; slot_part[i] = 0; }
     for (i = 0; i < 4; i++) pj_on[i] = 0;
     inv_keys = 0; stun_t = 0; n_open_doors = 0;
     n_entries = ld->nentries;
@@ -611,7 +689,7 @@ static void load_level(unsigned char lvl) {
     for (i = 0; i < n_entries && i < MAX_ENTRIES; i++) {
         en_mx[i] = *p++; en_my[i] = *p++; en_lvl[i] = *p++; en_done[i] = *p++;
         /* completed cities render their "done" art and stop being entries */
-        if (level_done[en_lvl[i]])
+        if (en_lvl[i] < NLEVELS && level_done[en_lvl[i]])
             ovr_add(en_mx[i], en_my[i], en_done[i]);
     }
     n_teleports = ld->nteleports;
@@ -621,10 +699,13 @@ static void load_level(unsigned char lvl) {
         tp_sx[i] = *p++; tp_sy[i] = *p++; tp_dx[i] = *p++; tp_dy[i] = *p++;
     }
 
+    anim_init();
+
     px = (int)ld->spawn_x; py = (int)ld->spawn_y;
     if (lvl) py -= 8;                      /* sprite is 16x24, tile anchor */
     vx = vy = sx_acc = sy_acc = 0;
     on_ground = jumping = pogoing = pogo_squat = 0;
+    jprep = 0; pogo_hold = 0; parts_at_entry = inv_parts; hint_used = 0;
     shoot_timer = 0; exiting = 0; dying = 0; seq_timer = 0;
     dir_right = 1; pframe = KF_STAND_R; cur_pframe = 0xFF; anim_t = 0;
     b_active = 0; fall_snd_on = 0;
@@ -643,7 +724,7 @@ static void load_level(unsigned char lvl) {
 }
 
 /* ------------------------------------------------------------ interstitial - */
-static void wait_frames(unsigned int n) {
+void wait_frames(unsigned int n) {
     while (n--) { SMS_waitForVBlank(); sfx_update(); }
 }
 
@@ -657,24 +738,225 @@ static void screen_text_begin(void) {
     font_load();
 }
 
-static void show_status(const char *line1) {
-    screen_text_begin();
-    print_at(8, 6, line1);
-    print_at(8, 10, "SCORE");
-    print_num(16, 10, score_hi, score_lo);
-    print_at(8, 12, "AMMO");
-    numbuf[0] = '0' + inv_ammo / 10; numbuf[1] = '0' + inv_ammo % 10; numbuf[2] = 0;
-    print_at(16, 12, numbuf);
-    if (inv_pogo) print_at(8, 14, "POGO STICK OK");
-    {
-        static char pb[] = "SHIP PARTS 0";
-        unsigned char n = 0, m = inv_parts;
-        while (m) { n += m & 1; m >>= 1; }
-        pb[11] = '0' + n;
-        if (n) print_at(8, 16, pb);
+/* -------------------------------------------------------------- dialogs --- */
+/* Boxes are drawn straight into the scrolling name table. While one is up
+   the scroll registers are snapped to a multiple of 8 so screen cell (cx,cy)
+   is NT cell ((cam_c8+cx)&31, (cam_r8+cy)%28); closing re-renders exactly
+   the covered cells from the map. Dialog tiles live in the sprite half of
+   VRAM (256+), which is reloaded afterwards. */
+char dlg_buf[168];
+static unsigned char dlg_x0, dlg_y0, dlg_w, dlg_h;     /* box incl. frame, in cells */
+static unsigned int  t_f0, t_f1, t_fr, t_ic, t_kn;     /* VRAM tile bases */
+
+void txt_get(unsigned char id) {
+    unsigned char ob = b2_shadow, i = 0;
+    const unsigned char *p;
+    SMS_mapROMBank(BANK_TXT);
+    p = txt_data + txt_off[id];
+    while (*p && i < sizeof(dlg_buf) - 1) dlg_buf[i++] = *p++;
+    dlg_buf[i] = 0;
+    SMS_mapROMBank(ob);
+}
+
+static void dlg_put(unsigned char cx, unsigned char cy, unsigned int tile) {
+    SMS_setTileatXY((unsigned char)((cam_c8 + dlg_x0 + cx) & 31),
+                    (unsigned char)((cam_r8 + dlg_y0 + cy) % 28), tile);
+}
+
+static void dlg_str(unsigned char cx, unsigned char cy, const char *s, unsigned int base) {
+    unsigned char x = cx;
+    for (; *s; s++) {
+        if (*s == '\n') { x = cx; cy++; continue; }
+        if (*s >= 32) dlg_put(x, cy, base + (unsigned char)(*s - 32));
+        x++;
     }
-    SMS_displayOn();
-    wait_frames(90);
+}
+
+/* box of (w x h) interior cells, centred; fill = tile for the interior */
+static void dlg_box(unsigned char w, unsigned char h, unsigned int fill) {
+    unsigned char x, y;
+    dlg_w = w + 2; dlg_h = h + 2;
+    dlg_x0 = 1 + (31 - dlg_w) / 2;
+    dlg_y0 = (24 - dlg_h) / 2;
+    SMS_waitForVBlank();
+    SMS_initSprites(); SMS_copySpritestoSAT();
+    SMS_setBGScrollX((unsigned char)(0 - (cam_c8 << 3)));
+    SMS_setBGScrollY((unsigned char)((cam_r8 % 28) << 3));
+    for (y = 0; y < dlg_h; y++)
+        for (x = 0; x < dlg_w; x++) {
+            unsigned int tile = fill;
+            if (y == 0)              tile = t_fr + (x == 0 ? 0 : (x == dlg_w - 1 ? 2 : 1));
+            else if (y == dlg_h - 1) tile = t_fr + (x == 0 ? 5 : (x == dlg_w - 1 ? 7 : 6));
+            else if (x == 0)         tile = t_fr + 3;
+            else if (x == dlg_w - 1) tile = t_fr + 4;
+            dlg_put(x, y, tile);
+        }
+}
+
+static void dlg_wait(void) {
+    unsigned int ks;
+    for (;;) { SMS_waitForVBlank(); sfx_update(); if (!(SMS_getKeysStatus() & (PORT_A_KEY_1 | PORT_A_KEY_2))) break; }
+    for (;;) {
+        SMS_waitForVBlank(); sfx_update();
+        ks = SMS_getKeysStatus();
+        if (ks & (PORT_A_KEY_1 | PORT_A_KEY_2)) break;
+    }
+    for (;;) { SMS_waitForVBlank(); if (!(SMS_getKeysStatus() & (PORT_A_KEY_1 | PORT_A_KEY_2))) break; }
+    prev_ks = SMS_getKeysStatus();
+}
+
+static void dlg_close(void) {
+    unsigned char x, y;
+    for (y = 0; y < dlg_h; y++) {
+        unsigned int wr = cam_r8 + dlg_y0 + y;
+        if (wr >= (mapH << 1)) continue;
+        for (x = 0; x < dlg_w; x++) {
+            unsigned int wc = cam_c8 + dlg_x0 + x;
+            if (wc >= (mapW << 1)) continue;
+            nt_write_cell(wc, wr);
+        }
+    }
+    SMS_waitForVBlank();
+    SMS_setBGScrollX((unsigned char)(0 - cam_x));
+    SMS_setBGScrollY(scroll_y);
+    /* sprite art that lived under the dialog tiles must be streamed again */
+    {
+        unsigned char s;
+        cur_pframe = 0xFF;
+        for (s = 0; s < N_SLOTS; s++) { slot_vframe[s] = 0xFE; slot_part[s] = 0; }
+        if (cur_level) {
+            map2(BANK_SPRITES);
+            SMS_loadTiles(spr_blt, VT_BULLET, 12 * 32);
+            SMS_loadTiles(spr_eray, VT_ERAY, 2 * 32);
+            SMS_loadTiles(spr_chunk, VT_CHUNK, 4 * 32);
+            map2(ld->map_bank);
+        }
+    }
+}
+
+/* load the plain message-box tile set: font 0 (black on white) + frame */
+static void dlg_tiles_msg(void) {
+    unsigned char ob = b2_shadow;
+    t_f0 = 256; t_fr = 256 + 96;
+    SMS_mapROMBank(BANK_TXT);
+    SMS_loadTiles(dlg_f0, t_f0, 96 * 32);
+    SMS_loadTiles(dlg_frame, t_fr, 8 * 32);
+    SMS_mapROMBank(ob);
+}
+
+/* "You hear in your mind..." style box from string id */
+static void show_text_box(unsigned char id) {
+    unsigned char w = 0, h = 1, cur = 0;
+    const char *s;
+    txt_get(id);
+    for (s = dlg_buf; *s; s++) {
+        if (*s == '\n') { if (cur > w) w = cur; cur = 0; h++; } else cur++;
+    }
+    if (cur > w) w = cur;
+    dlg_tiles_msg();
+    dlg_box(w + 2, h + 2, t_f0);              /* one cell of padding all round */
+    dlg_str(2, 2, dlg_buf, t_f0);
+}
+
+static void show_hint(unsigned char lvl_msg) {
+    show_text_box(lvl_msg);
+    dlg_wait();
+    dlg_close();
+}
+
+/* 16x16 icon (4 tiles) at interior cell (cx,cy); pal = NT palette bit */
+static void dlg_icon(unsigned char cx, unsigned char cy, unsigned int base, unsigned int pal) {
+    dlg_put(cx,     cy,     base     | pal);
+    dlg_put(cx + 1, cy,     base + 1 | pal);
+    dlg_put(cx,     cy + 1, base + 2 | pal);
+    dlg_put(cx + 1, cy + 1, base + 3 | pal);
+}
+
+static void show_ship_box(void) {
+    unsigned char i, ob = b2_shadow;
+    show_text_box(TXT_SHIP);
+    t_ic = t_fr + 8;
+    SMS_mapROMBank(BANK_TXT);
+    SMS_loadTiles(dlg_icons + 6 * 128, t_ic, 4 * 4 * 32);   /* the four "missing part" icons */
+    SMS_mapROMBank(ob);
+    for (i = 0; i < 4; i++)
+        if (!(inv_parts & (1 << i)))
+            dlg_icon(5 + 4 * i, 5, t_ic + 4 * i, 0);
+    dlg_wait();
+    dlg_close();
+}
+
+static void show_keens_left(void) {
+    unsigned char i, ob = b2_shadow;
+    dlg_tiles_msg();
+    t_kn = t_fr + 8;
+    SMS_mapROMBank(BANK_TXT);
+    SMS_loadTiles(dlg_keen, t_kn, 4 * 32);
+    SMS_mapROMBank(ob);
+    dlg_box(23, 4, t_f0);
+    txt_get(TXT_LIVES);
+    dlg_str(5, 1, dlg_buf + 3, t_f0);          /* "Keens Left" without the lead-in spaces */
+    for (i = 0; i < lives && i < 10; i++)
+        dlg_icon(1 + i * 2, 3, t_kn, 0);
+    {
+        unsigned char f;
+        for (f = 0; f < 180; f++) {
+            SMS_waitForVBlank(); sfx_update();
+            if (f > 20 && (SMS_getKeysStatus() & (PORT_A_KEY_1 | PORT_A_KEY_2))) break;
+        }
+    }
+    dlg_close();
+    prev_ks = SMS_getKeysStatus();
+}
+
+static void dlg_num(unsigned char cx, unsigned char cy, unsigned long v, unsigned char right_edge) {
+    char nb[8]; unsigned char n = 0, i;
+    do { nb[n++] = '0' + (unsigned char)(v % 10); v /= 10; } while (v && n < 7);
+    for (i = 0; i < n; i++)
+        dlg_put(right_edge - i, cy, t_f0 + (unsigned char)(nb[i] - 32));
+    (void)cx;
+}
+
+static void dlg_field(unsigned char x, unsigned char y, unsigned char w, unsigned char h) {
+    unsigned char i, j;
+    for (j = 0; j < h; j++) for (i = 0; i < w; i++) dlg_put(x + i, y + j, t_f0);
+}
+
+/* the original status box (CStatusScreen): 30x15 cells */
+static void show_status_box(void) {
+    unsigned char i, ob = b2_shadow;
+    unsigned long sc = (unsigned long)score_hi * 10000UL + score_lo;
+    SMS_waitForVBlank();
+    /* tile set: font1 (red on grey, 64) | font0 ' '..'9' (26) | frame (8) | icons (14*4) | keen (4) */
+    t_f1 = 256; t_f0 = 256 + 64; t_fr = t_f0 + 26; t_ic = t_fr + 8; t_kn = t_ic + 56;
+    SMS_mapROMBank(BANK_TXT);
+    SMS_loadTiles(dlg_f1, t_f1, 64 * 32);
+    SMS_loadTiles(dlg_f0, t_f0, 26 * 32);
+    SMS_loadTiles(dlg_frame, t_fr, 8 * 32);
+    SMS_loadTiles(dlg_icons, t_ic, 56 * 32);
+    SMS_loadTiles(dlg_keen, t_kn, 4 * 32);
+    SMS_mapROMBank(ob);
+    dlg_box(28, 13, t_f1);
+    txt_get(TXT_STATUS);
+    dlg_str(1, 1, dlg_buf, t_f1);
+    dlg_field(1, 2, 12, 1);  dlg_field(14, 2, 15, 1);          /* score / extra keen at */
+    dlg_field(1, 4, 14, 3);  dlg_field(16, 4, 13, 3);          /* keens / ship parts */
+    dlg_field(1, 8, 8, 3);   dlg_field(10, 8, 6, 5);  dlg_field(17, 8, 12, 5);
+    dlg_field(1, 12, 8, 1);                                    /* charges */
+    dlg_num(0, 2, sc, 11);
+    dlg_num(0, 2, (unsigned long)next_life * 10000UL, 27);
+    dlg_icon(4, 8, t_ic, 0);                                   /* raygun */
+    if (inv_pogo) dlg_icon(12, 9, t_ic + 4, 0);
+    for (i = 0; i < 4; i++)
+        if (inv_keys & (1 << i))
+            dlg_icon(20 + (i & 1) * 4, 8 + (i >> 1) * 2, t_ic + 8 + 4 * i, 0);
+    for (i = 0; i < 4; i++)
+        dlg_icon(17 + 3 * i, 4, t_ic + ((inv_parts & (1 << i)) ? 40 : 24) + 4 * i, 0);
+    dlg_num(0, 12, inv_ammo, 5);
+    for (i = 0; i < lives && i < 6; i++)
+        dlg_icon(2 + i * 2, 4, t_kn, 0);
+    dlg_wait();
+    dlg_close();
 }
 
 /* ---------------------------------------------------------------- player --- */
@@ -691,13 +973,13 @@ static void player_move_x(void) {
     sx_acc -= dx << 8;
     if (dx > 0) {
         unsigned char f = probe3_x(px + 12 + dx, py);
-        if (f & F_SOLID) {
+        if (f & F_BLKR) {
             px = (((px + 12 + dx) & ~15) - 13);
             vx = 0; sx_acc = 0;
         } else px += dx;
     } else if (dx < 0) {
         unsigned char f = probe3_x(px + 3 + dx, py);
-        if (f & F_SOLID) {
+        if (f & F_BLKL) {
             px = ((((px + 3 + dx) >> 4) + 1) << 4) - 3;
             vx = 0; sx_acc = 0;
         } else px += dx;
@@ -715,7 +997,7 @@ static void player_move_y(void) {
         int ny = py + 23 + dy;                 /* new feet */
         unsigned char f = mflag(px + 4, ny) | mflag(px + 11, ny);
         unsigned char crossed = ((py + 23) >> 4) < (ny >> 4);
-        if ((f & F_SOLID) || ((f & F_PLAT) && crossed)) {
+        if ((f & F_UP) && ((f & F_CEIL) || crossed)) {
             py = ((ny & ~15) - 24);
             vy = 0; sy_acc = 0;
             if (!on_ground) {                   /* landing */
@@ -727,7 +1009,7 @@ static void player_move_y(void) {
     } else if (dy < 0) {
         int ny = py + 1 + dy;                  /* new head */
         unsigned char f = mflag(px + 4, ny) | mflag(px + 11, ny);
-        if ((f & F_SOLID) && !(f & F_PLAT)) {
+        if (f & F_CEIL) {
             py = ((((ny >> 4) + 1) << 4) - 1);
             vy = 0; sy_acc = 0;
             sfx_play(SND_BUMPHEAD);
@@ -737,16 +1019,21 @@ static void player_move_y(void) {
         /* recheck ground under feet */
         int fy = py + 24;
         unsigned char f = mflag(px + 4, fy) | mflag(px + 11, fy);
-        on_ground = ((f & F_SOLID) || ((f & F_PLAT) && ((fy & 15) == 0))) ? 1 : 0;
+        on_ground = ((f & F_UP) && ((f & F_CEIL) || (fy & 15) == 0)) ? 1 : 0;
         if (on_ground) jumping = 0;
     }
 }
+
+/* player life cycle (CG: pdie / dieanim). lives are shown on the status
+   screen; losing the last one ends the game. */
 
 static void player_die(void) {
     if (dying) return;
     dying = 1; seq_timer = 0;
     sfx_play(SND_DIE);
-    vx = vy = 0;
+    vx = vy = 0; pogoing = 0; jprep = 0; jumping = 0;
+    lives--;
+    inv_parts = parts_at_entry;               /* a part found in this level is lost */
 }
 
 static void spawn_bullet(void) {
@@ -760,14 +1047,27 @@ static void spawn_bullet(void) {
     sfx_play(SND_FIRE);
 }
 
-static void player_update(unsigned int ks, unsigned int kp) {
-    unsigned char i;
+static unsigned char flags_under(void) {      /* tiles just below the feet */
+    return mflag(px + 4, py + 24) | mflag(px + 11, py + 24);
+}
 
-    if (dying) {
+static void player_launch(int v) {
+    vy = v; on_ground = 0; jumping = 1; jprep = 0; sy_acc = 0;
+}
+
+static void player_update(unsigned int ks, unsigned int kp) {
+    unsigned char i, ice = 0, semi = 0;
+
+    if (dying) {                               /* CG dieanim: 80 ticks, then fly off */
         seq_timer++;
-        pframe = (seq_timer & 8) ? KF_DIE1 : KF_DIE0;
-        if (seq_timer > 40 && seq_timer <= 130) py -= 2;   /* float away */
-        if (seq_timer > 130) { game_state = STATE_OW; }
+        pframe = ((seq_timer / 6) & 1) ? KF_DIE1 : KF_DIE0;
+        if (seq_timer > 80) {
+            if (py > (int)cam_y - 32 && py > 48 - 128) {
+                py -= 5;
+                px += (int)(rng & 3) - 1;
+            } else game_state = STATE_DEAD;
+        }
+        rng = rng * 5 + 3;
         return;
     }
     if (exiting) {
@@ -776,52 +1076,84 @@ static void player_update(unsigned int ks, unsigned int kp) {
         player_move_x();
         anim_t++;
         if (!(anim_t & 7)) {
-            if (++anim_ph == 3) anim_ph = 0;
+            if (++anim_ph == 4) anim_ph = 0;
             if (on_ground)
-                sfx_play((anim_t & 8) ? SND_WALK2 : SND_WALK1);
+                sfx_play((anim_ph & 1) ? SND_WALK2 : SND_WALK1);
         }
-        pframe = KF_WALK_R + anim_ph;
+        pframe = KF_WALK_R + walk_seq[anim_ph];
         if (seq_timer > 70) {
             level_done[cur_level] = 1;
-            game_state = (inv_parts == 0x0F) ? STATE_WIN : STATE_OW;
+            game_state = STATE_OW;
         }
         return;
     }
 
-    /* icy-chunk stun: Keen can't act for a moment */
+    /* frozen by an ice chunk (CG keencicle: 250 ticks, thaw frame at the end) */
     if (stun_t) {
         stun_t--;
         ks = 0; kp = 0;
+        if (on_ground && !(flags_under() & F_ICE)) vx = 0;
+        pframe = (stun_t < 20) ? 31 : (28 + ((stun_t / 26) & 1));
     }
 
-    /* pogo toggle: DOWN + button 1 */
-    if ((kp & PORT_A_KEY_1) && (ks & PORT_A_KEY_DOWN) && inv_pogo) {
+    if (on_ground && !pogoing) {
+        unsigned char f = flags_under();
+        if (f & F_ICE3) ice = 1;
+        else if (f & F_ICE) semi = 1;
+    }
+
+    /* pogo toggle: DOWN + button 1 (CG: its own pogo key) */
+    if ((kp & PORT_A_KEY_1) && (ks & PORT_A_KEY_DOWN) && inv_pogo && !jprep && !stun_t) {
         pogoing = !pogoing;
-        pogo_squat = 0;
-        if (pogoing && on_ground) { vy = POGO_LO_V; on_ground = 0; jumping = 1; sfx_play(SND_POGO); }
+        pogo_squat = 0; pogo_hold = 0;
+        if (pogoing) { jump_buf = 0; }
     }
 
     if (pogoing) {
+        if (ks & PORT_A_KEY_1) { if (pogo_hold < 40) pogo_hold++; } else pogo_hold = 0;
         if (ks & PORT_A_KEY_LEFT)  { vx -= POGO_STEER; dir_right = 0; }
         if (ks & PORT_A_KEY_RIGHT) { vx += POGO_STEER; dir_right = 1; }
         if (vx >  WALK_MAX) vx =  WALK_MAX;
         if (vx < -WALK_MAX) vx = -WALK_MAX;
         if (on_ground) {
-            if (!pogo_squat) pogo_squat = 1;
-            else if (++pogo_squat > 6) {
+            /* compressed for PPOGO_PREPARE_TIME ticks, then bounce; the
+               longer jump has been held, the higher (up to 1.1*165) */
+            if (++pogo_squat > 10) {
+                int v = POGO_LO_V;
                 pogo_squat = 0;
-                /* holding jump during the bounce gives the original's
-                   high pogo jump (about twice normal jump height) */
-                if (ks & PORT_A_KEY_1) { vy = POGO_HI_V; sfx_play(SND_POGOJUMP); }
-                else                   { vy = POGO_LO_V; sfx_play(SND_POGO); }
-                on_ground = 0; jumping = 1;
+                if (pogo_hold) {
+                    v = -(960 + pogo_hold * 29);
+                    if (v < POGO_HI_V) v = POGO_HI_V;
+                    sfx_play(SND_POGOJUMP);
+                } else sfx_play(SND_POGO);
+                player_launch(v);
             }
         }
         pframe = on_ground ? (dir_right ? KF_POGO_DN_R : KF_POGO_DN_L)
                            : (dir_right ? KF_POGO_UP_R : KF_POGO_UP_L);
+    } else if (jprep) {
+        /* crouching for the jump: frames 8..13, one step per 3 ticks; the
+           jump key is sampled as it is released (or frame 13 reached) */
+        if (++jtimer > 2) {
+            jtimer = 0;
+            if (jframe == 5 || !(ks & PORT_A_KEY_1)) {
+                int v = (jframe >= 4) ? JUMP_V : (int)(((long)JUMP_V * jframe) / 5);
+                if (ice) dir_right = dir_right;     /* ice: keep facing */
+                else if (!(ks & (PORT_A_KEY_LEFT | PORT_A_KEY_RIGHT))) vx = 0;
+                if (ks & PORT_A_KEY_LEFT)  { vx = -512; dir_right = 0; }
+                if (ks & PORT_A_KEY_RIGHT) { vx =  512; dir_right = 1; }
+                sfx_play(SND_JUMP);
+                player_launch(v);
+            } else jframe++;
+        }
+        pframe = (dir_right ? 8 : 14) + jframe;
     } else {
-        /* walking */
-        if (shoot_timer && on_ground) {
+        /* walking / sliding */
+        if (ice) {
+            if (ks & PORT_A_KEY_LEFT)       dir_right = 0;
+            else if (ks & PORT_A_KEY_RIGHT) dir_right = 1;
+            vx = dir_right ? WALK_MAX : -WALK_MAX;
+        } else if (shoot_timer && on_ground) {
             vx = 0;                              /* frozen while shooting     */
         } else if (ks & PORT_A_KEY_LEFT) {
             vx -= on_ground ? WALK_ACC : AIR_ACC;
@@ -832,39 +1164,43 @@ static void player_update(unsigned int ks, unsigned int kp) {
             if (vx > WALK_MAX) vx = WALK_MAX;
             dir_right = 1;
         } else {
-            if (on_ground) vx = 0;
-            else vx = (vx * 3) >> 2;             /* air drag, like the JS     */
+            if (on_ground) { if (!semi) vx = 0; }   /* semi-ice: coast */
+            else vx = (vx * 15) >> 4;
         }
-        /* jump (with a small press buffer: a press a few frames before
-           landing still triggers the jump on touchdown) */
-        if ((kp & PORT_A_KEY_1) && !(ks & PORT_A_KEY_DOWN))
+        /* jump press starts the crouch (buffered a few frames) */
+        if ((kp & PORT_A_KEY_1) && !(ks & PORT_A_KEY_DOWN) && !stun_t)
             jump_buf = JUMP_BUF_FRAMES;
-        if (jump_buf && on_ground) {
+        if (jump_buf && on_ground && !shoot_timer) {
             jump_buf = 0;
-            vy = JUMP_V; on_ground = 0; jumping = 1;
-            sfx_play(SND_JUMP);
+            jprep = 1; jframe = 0; jtimer = 0;
+            if (!ice) vx = 0;
         }
         if (jump_buf) jump_buf--;
     }
 
-    /* fire */
-    if (kp & PORT_A_KEY_2) {
+    /* fire (CG: shot frame shown 25 ticks) */
+    if ((kp & PORT_A_KEY_2) && !jprep && !stun_t) {
         spawn_bullet();
-        shoot_timer = 14;
+        shoot_timer = 25;
     }
     if (shoot_timer) shoot_timer--;
 
-    /* gravity */
+    /* gravity (CG: up-decel 4, fall accel 8 after the apex, ledge fall 4) */
     if (!on_ground) {
-        vy += GRAV;
+        if (jumping) {
+            vy += (vy < 0) ? GRAV_UP : GRAV_DN;
+        } else {
+            if (vy < 256) vy = 256;
+            vy += GRAV_WALKOFF;
+        }
         if (vy > FALL_MAX) vy = FALL_MAX;
     }
 
-    player_move_x();
+    if (!jprep) player_move_x();
     player_move_y();
 
-    /* falling sound trigger */
-    if (!on_ground && vy > 512 && !jumping && !fall_snd_on) {
+    /* walked off a ledge */
+    if (!on_ground && !jumping && !fall_snd_on) {
         fall_snd_on = 1;
         sfx_play(SND_PLUMMET);
     }
@@ -880,7 +1216,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
             player_die(); return;
         }
     }
-    /* fell out of the world */
+    /* fell out of the world (CG: PLUMMET finishes, then Keen dies) */
     if (py > (int)mapPH + 16) { player_die(); seq_timer = 120; return; }
 
     /* items: the table is sorted by column; keep a cached start index and
@@ -902,9 +1238,21 @@ static void player_update(unsigned int ks, unsigned int kp) {
         if (px + 12 >= cx && px + 3 <= cx + 15 &&
             py + 23 >= cy && py + 1 <= cy + 15) {
             unsigned char k = it_kind[i];
+            if (k == K_HINT && (hint_used || stun_t)) continue;
             it_taken[i] = 1;
+            if (k == K_TELE) {                   /* in-level teleporter: back to Mars */
+                sfx_play(SND_TELEPORT);
+                tele_pending = 1;
+                game_state = STATE_OW;
+                return;
+            }
             ovr_add(it_mx[i], it_my[i], it_restore[i]);
             nt_update_cell(it_mx[i], it_my[i]);
+            if (k == K_HINT) {                   /* once per level: the statue's message */
+                hint_used = 1;
+                show_hint(hint_msg[cur_level]);
+                return;
+            }
             add_score(k);
             if (k == K_AMMO)      { inv_ammo += 5; sfx_play(SND_ITEM); }
             else if (k == K_POGO) { inv_pogo = 1;  sfx_play(SND_ITEM); }
@@ -918,7 +1266,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
     }
 
     /* exit door cells (tile 159): touch while grounded */
-    if (on_ground && !pogoing) {
+    if (on_ground && !pogoing && !jprep) {
         unsigned char ecx = (unsigned char)((unsigned int)(px + 8) >> 4);
         unsigned char ecy = (unsigned char)((unsigned int)(py + 12) >> 4);
         for (i = 0; i < n_exits; i++)
@@ -953,16 +1301,21 @@ static void player_update(unsigned int ks, unsigned int kp) {
     }
 
     /* animation */
+    if (stun_t) return;                          /* frozen frame set above */
+    if (jprep) return;
     if (!on_ground) {
         pframe = dir_right ? KF_FALL_R : KF_FALL_L;
         if (pogoing) pframe = dir_right ? KF_POGO_UP_R : KF_POGO_UP_L;
     } else if (shoot_timer) {
         pframe = dir_right ? KF_SHOOT_R : KF_SHOOT_L;
     } else if (!pogoing) {
-        if (vx) {
+        if (vx && !ice) {
             anim_t++;
-            if (!(anim_t & 7) && ++anim_ph == 3) anim_ph = 0;
-            pframe = (dir_right ? KF_WALK_R : KF_WALK_L) + anim_ph;
+            if (!(anim_t & 7)) {
+                if (++anim_ph == 4) anim_ph = 0;
+                sfx_play((anim_ph & 1) ? SND_WALK2 : SND_WALK1);
+            }
+            pframe = (dir_right ? KF_WALK_R : KF_WALK_L) + walk_seq[anim_ph];
         } else {
             pframe = dir_right ? KF_STAND_R : KF_STAND_L;
         }
@@ -981,7 +1334,7 @@ static void bullet_update(void) {
     /* out of view */
     if (b_px < (int)cam_x - 24 || b_px > (int)cam_x + 272) { b_active = 0; return; }
     /* wall */
-    if (mflag(b_px + 8, b_py + 4) & F_SOLID) {
+    if (mflag(b_px + 8, b_py + 4) & (b_right ? F_BLKR : F_BLKL)) {
         b_hit = 1; b_timer = 0;
         rng = rng * 13 + 7;
         sfx_play(SND_SHOTHIT);
@@ -1001,7 +1354,6 @@ static void bullet_update(void) {
             sfx_play((e_type[i] == ET_YORP) ? SND_YORPSCREAM :
                      (e_type[i] == ET_GARG) ? SND_GARGSCREAM :
                                               SND_VORTSCREAM);
-            add_score(0);
             return;
         }
     }
@@ -1020,10 +1372,10 @@ static void ent_move(unsigned char i, unsigned char gravity) {
     d = y_sx[i] >> 8; y_sx[i] -= d << 8;
     if (d > 0) {
         f = mflag(y_px[i] + 13 + d, y_py[i] + 8) | mflag(y_px[i] + 13 + d, y_py[i] + 20);
-        if (f & F_SOLID) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
+        if (f & F_BLKR) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
     } else if (d < 0) {
         f = mflag(y_px[i] + 2 + d, y_py[i] + 8) | mflag(y_px[i] + 2 + d, y_py[i] + 20);
-        if (f & F_SOLID) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
+        if (f & F_BLKL) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
     }
     y_pg[i] = (unsigned char)(((unsigned int)y_px[i]) >> 8);
     y_sy[i] += y_vy[i];
@@ -1032,26 +1384,26 @@ static void ent_move(unsigned char i, unsigned char gravity) {
         int ny = y_py[i] + 23 + d;
         unsigned char crossed = ((y_py[i] + 23) >> 4) < (ny >> 4);
         f = mflag(y_px[i] + 4, ny) | mflag(y_px[i] + 11, ny);
-        if ((f & F_SOLID) || ((f & F_PLAT) && crossed)) {
+        if ((f & F_UP) && ((f & F_CEIL) || crossed)) {
             y_py[i] = (ny & ~15) - 24; y_vy[i] = 0; y_sy[i] = 0;
         } else y_py[i] += d;
     } else if (d < 0) {
         int ny = y_py[i] + 1 + d;
         f = mflag(y_px[i] + 4, ny) | mflag(y_px[i] + 11, ny);
-        if ((f & F_SOLID) && !(f & F_PLAT)) { y_vy[i] = 0; y_sy[i] = 0; }
+        if (f & F_CEIL) { y_vy[i] = 0; y_sy[i] = 0; }
         else y_py[i] += d;
     }
 }
 
 static unsigned char ent_grounded(unsigned char i) {
     return ((mflag(y_px[i] + 4, y_py[i] + 24) |
-             mflag(y_px[i] + 11, y_py[i] + 24)) & (F_SOLID | F_PLAT)) ? 1 : 0;
+             mflag(y_px[i] + 11, y_py[i] + 24)) & F_UP) ? 1 : 0;
 }
 
 /* is a walk in direction dir (0=left 1=right) about to step off a ledge? */
 static unsigned char ent_at_edge(unsigned char i, unsigned char right) {
     int ex = right ? (y_px[i] + 15) : y_px[i];
-    return !(mflag(ex, y_py[i] + 26) & (F_SOLID | F_PLAT));
+    return !(mflag(ex, y_py[i] + 26) & F_UP);
 }
 
 static unsigned char player_overlap(unsigned char i) {
@@ -1256,11 +1608,11 @@ static void proj_update(void) {
         pj_x[i] = nx; pj_y[i] = ny;
         if (nx < (int)cam_x - 32 || nx > (int)cam_x + 288 ||
             ny < -16 || ny > (int)mapPH + 16) { pj_on[i] = 0; continue; }
-        if (mflag(nx + 8, ny + 4) & F_SOLID) { pj_on[i] = 0; continue; }
+        if (mflag(nx + 8, ny + 4) & (F_BLKR | F_BLKL)) { pj_on[i] = 0; continue; }
         if (!dying &&
             nx + 12 >= px + 3 && nx + 4 <= px + 12 &&
             ny + 8  >= py + 2 && ny     <= py + 22) {
-            if (pj_on[i] == 1) { stun_t = 90; sfx_play(SND_KEENCICLE); }
+            if (pj_on[i] == 1) { if (!stun_t) { stun_t = 250; pogoing = 0; jprep = 0; } sfx_play(SND_KEENCICLE); }
             else player_die();
             pj_on[i] = 0;
         }
@@ -1306,13 +1658,23 @@ static void draw_16x24(int sx, int sy, unsigned char base) {
     SMS_addSpriteClipping(sx + 8, sy + 16, base + 5);
 }
 
+/* 24x32 body (garg, vorticon): 12 hardware sprites, row-major 3x4 */
+static void draw_24x32(int sx, int sy, unsigned char base) {
+    unsigned char r, c;
+    for (r = 0; r < 4; r++)
+        for (c = 0; c < 3; c++)
+            SMS_addSpriteClipping(sx + c * 8, sy + r * 8, base + r * 3 + c);
+}
+
 static unsigned char upload_slot;               /* slot needing stream, or 0xFF */
+static unsigned char upload_part;
 static unsigned char upload_frame;              /* (type<<4)|frame key */
 static unsigned char upload_ent;
 
 /* per-type sprite sheet base (bank2 array) resolved at upload time */
 static const unsigned char * const ent_art[5] =
     { 0, 0, 0, 0, 0 };                 /* filled in main() (banked consts) */
+#define ET_BIG(t) ((t) == ET_GARG || (t) == ET_VORT)
 static const unsigned char *ent_art_ptr(unsigned char t) {
     switch (t) {
     case ET_YORP:   return spr_yorp;
@@ -1369,10 +1731,16 @@ static void build_sprites_level(void) {
         s = y_slot[i];
         key = (e_type[i] << 4) | y_frame[i];
         if (slot_vframe[s] != key && upload_slot == 0xFF) {
+            if (slot_part[s] && slot_pkey[s] != key) slot_part[s] = 0;
             upload_slot = s; upload_frame = key; upload_ent = i;
+            upload_part = slot_part[s];
         }
-        if (slot_vframe[s] != 0xFE)
-            draw_16x24(sx, sy, (unsigned char)(VT_SLOT0 - 256 + s * 6));
+        if (slot_vframe[s] != 0xFE) {
+            if (ET_BIG(e_type[i]))               /* 24x32, bottom-anchored */
+                draw_24x32(sx - 4, sy - 8, (unsigned char)(VT_SLOT0 - 256 + s * 12));
+            else
+                draw_16x24(sx, sy, (unsigned char)(VT_SLOT0 - 256 + s * 12));
+        }
     }
     /* keen's zap */
     if (b_active) {
@@ -1426,7 +1794,7 @@ static void run_level(void) {
         SMS_setBGScrollX((unsigned char)(0 - cam_x));
         SMS_setBGScrollY(scroll_y);
 
-        SMS_mapROMBank(BANK_SPRITES);
+        map2(BANK_SPRITES);
         if (col_ready && row_ready)
             upload_slot = 0xFF;   /* diagonal-crossing frame: both strips
                                      blit this vblank, defer art streaming
@@ -1436,17 +1804,34 @@ static void run_level(void) {
             cur_pframe = pframe;
             upload_slot = 0xFF;   /* one 192B burst per frame */
         }
+        else if (upload_slot == 0xFF && ab_n) anim_upload();
         if (upload_slot != 0xFF) {
-            UNSAFE_SMS_loadNTiles(ent_art_ptr(upload_frame >> 4)
-                                    + (unsigned int)(upload_frame & 15) * 192,
-                                  VT_SLOT0 + upload_slot * 6, 6);
-            slot_vframe[upload_slot] = upload_frame;
+            unsigned char ut = upload_frame >> 4;
+            if (ET_BIG(ut)) {
+                map2(BANK_SPR2);
+                UNSAFE_SMS_loadNTiles(ent_art_ptr(ut)
+                                        + (unsigned int)(upload_frame & 15) * 384
+                                        + (unsigned int)upload_part * 192,
+                                      VT_SLOT0 + upload_slot * 12 + upload_part * 6, 6);
+                if (upload_part == 0) {
+                    slot_part[upload_slot] = 1; slot_pkey[upload_slot] = upload_frame;
+                } else {
+                    slot_part[upload_slot] = 0;
+                    slot_vframe[upload_slot] = upload_frame;
+                }
+            } else {
+                UNSAFE_SMS_loadNTiles(ent_art_ptr(ut)
+                                        + (unsigned int)(upload_frame & 15) * 192,
+                                      VT_SLOT0 + upload_slot * 12, 6);
+                slot_vframe[upload_slot] = upload_frame;
+            }
             upload_slot = 0xFF;
         }
-        SMS_mapROMBank(ld->map_bank);
+        map2(ld->map_bank);
         if (col_ready) { blit_col(); col_ready = 0; }
         if (row_ready) { blit_row(); row_ready = 0; }
 
+        if (SMS_queryPauseRequested()) { SMS_resetPauseRequest(); show_status_box(); }
         ks = SMS_getKeysStatus();
         kp = ks & ~prev_ks;
         prev_ks = ks;
@@ -1463,6 +1848,7 @@ static void run_level(void) {
                 rebuild_near();
             }
             for (k = 0; k < n_near; k++) ent_update(near_list[k]);
+            anim_scan();
         }
         sfx_update();
 
@@ -1482,11 +1868,11 @@ static unsigned char ow_dir;            /* 0=down 1=right 2=up 3=left */
 static unsigned char ow_moving;
 
 static void build_sprites_ow(void) {
-    static const unsigned char stand_f[4] = { 0, 6, 8, 15 };
+    static const unsigned char stand_f[4] = { 4, 0, 12, 8 };
     unsigned char f;
     int sx = px - (int)cam_x, sy = py - (int)cam_y;
     if (ow_moving) {
-        static const unsigned char walk_f[4] = { 0, 4, 8, 12 };
+        static const unsigned char walk_f[4] = { 4, 0, 12, 8 };
         f = walk_f[ow_dir] + ((anim_t >> 3) & 3);
     } else f = stand_f[ow_dir];
     pframe = f;
@@ -1497,21 +1883,90 @@ static void build_sprites_ow(void) {
     SMS_addSpriteClipping(sx + 8, sy + 8, (unsigned char)(VT_OWKEEN - 256 + 3));
 }
 
+/* map pause menu: Status / Save Game.  Returns 1 when the screen was
+   handed to the save overlay (the map must be reloaded). */
+static void call_ovl(unsigned char bank, void (*fn)(void));
+static unsigned char ow_pause_menu(void) {
+    unsigned char sel = 0, i, done = 0, go = 0;
+    unsigned int kp, ks;
+    dlg_tiles_msg();
+    dlg_box(13, 4, t_f0);
+    dlg_str(2, 1, "Status", t_f0);
+    dlg_str(2, 2, "Save Game", t_f0);
+    dlg_str(2, 3, "Resume", t_f0);
+    prev_ks = SMS_getKeysStatus();
+    while (!done) {
+        for (i = 0; i < 3; i++) dlg_put(1, 1 + i, t_f0 + (i == sel ? '>' - 32 : 0));
+        SMS_waitForVBlank(); sfx_update();
+        ks = SMS_getKeysStatus(); kp = ks & ~prev_ks; prev_ks = ks;
+        if (kp & PORT_A_KEY_UP)   sel = sel ? sel - 1 : 2;
+        if (kp & PORT_A_KEY_DOWN) sel = sel < 2 ? sel + 1 : 0;
+        if (kp & PORT_A_KEY_2) { sel = 2; done = 1; }
+        if (kp & PORT_A_KEY_1) done = 1;
+    }
+    dlg_close();
+    if (sel == 0) show_status_box();
+    else if (sel == 1) {
+        ow_px = px; ow_py = py;
+        call_ovl(BANK_OVL_FRONT, ovl_save);
+        go = 1;
+    }
+    return go;
+}
+
 /* a solid probe point is forgiven if its cell is a gate whose level is done */
 static unsigned char ow_blocked(int nx, int ny) {
     /* 12x14 box inside the 16x16 frame */
     return ((mflag(nx + 2,  ny + 2)  | mflag(nx + 13, ny + 2) |
-             mflag(nx + 2,  ny + 15) | mflag(nx + 13, ny + 15)) & F_SOLID) ? 1 : 0;
+             mflag(nx + 2,  ny + 15) | mflag(nx + 13, ny + 15)) & (F_BLKR | F_BLKL)) ? 1 : 0;
+}
+
+static unsigned char ow_cx, ow_cy;       /* cell Keen is standing on */
+
+/* snap the camera to (tx,ty) and redraw the whole screen */
+static void cam_warp(int tx, int ty) {
+    cam_x = cam_y = 0; scroll_y = 0;
+    camera_follow(tx, ty);
+    cam_c8 = cam_x >> 3; cam_r8 = cam_y >> 3;
+    set_scroll_y_full();
+    full_redraw();
+    SMS_setBGScrollX((unsigned char)(0 - cam_x));
+    SMS_setBGScrollY(scroll_y);
+}
+
+/* put Keen on a map position, snap the camera and redraw the screen */
+static void ow_warp(int nx, int ny) {
+    px = nx; py = ny;
+    if (px > (int)mapPW - 16) px = (int)mapPW - 16;
+    if (py > (int)mapPH - 16) py = (int)mapPH - 16;
+    cam_warp(px + 8 - 124, py + 8 - 92);
+    ow_cx = (unsigned char)((unsigned int)(px + 8) >> 4);
+    ow_cy = (unsigned char)((unsigned int)(py + 8) >> 4);
 }
 
 static void run_overworld(void) {
     unsigned int ks, kp;
     unsigned char i;
 
+    if (inv_parts == 0x0F) { game_state = STATE_WIN; return; }   /* all four parts: home! */
     cur_level = 0;
     load_level(0);
     ow_dir = 0; ow_moving = 0; cur_pframe = 0xFF;
     prev_ks = SMS_getKeysStatus();
+    ow_cx = (unsigned char)((unsigned int)(px + 8) >> 4);
+    ow_cy = (unsigned char)((unsigned int)(py + 8) >> 4);
+    if (tele_pending) {                        /* came out of the in-level teleporter */
+        tele_pending = 0;
+        ow_warp((int)TELE_DX << 4, (int)TELE_DY << 4);
+        sfx_play(SND_TELEPORT);
+    } else if (ow_px >= 0) {
+        ow_warp(ow_px, ow_py);                 /* back where Keen entered the level */
+    }
+    if (show_lives) {
+        show_lives = 0;
+        build_sprites_ow();
+        show_keens_left();
+    }
 
     while (game_state == STATE_OW) {
         SMS_waitForVBlank();
@@ -1521,15 +1976,19 @@ static void run_overworld(void) {
         SMS_setBGScrollX((unsigned char)(0 - cam_x));
         SMS_setBGScrollY(scroll_y);
 
-        SMS_mapROMBank(BANK_SPRITES);
+        map2(BANK_SPRITES);
         if (pframe != cur_pframe) {
             UNSAFE_SMS_loadNTiles(spr_owk + (unsigned int)pframe * 128, VT_OWKEEN, 4);
             cur_pframe = pframe;
-        }
-        SMS_mapROMBank(ld->map_bank);
+        } else if (ab_n) anim_upload();
+        map2(ld->map_bank);
         if (col_ready) { blit_col(); col_ready = 0; }
         if (row_ready) { blit_row(); row_ready = 0; }
 
+        if (SMS_queryPauseRequested()) {
+            SMS_resetPauseRequest();
+            if (ow_pause_menu()) return;         /* map reloads on re-entry */
+        }
         ks = SMS_getKeysStatus();
         kp = ks & ~prev_ks;
         prev_ks = ks;
@@ -1547,49 +2006,34 @@ static void run_overworld(void) {
         if (px > (int)mapPW - 16) px = (int)mapPW - 16;
         if (py > (int)mapPH - 16) py = (int)mapPH - 16;
 
-        /* teleporter? (stand on a teleport pad, press a button) */
-        if (kp & (PORT_A_KEY_1 | PORT_A_KEY_2)) {
+        /* stepping onto a new cell: teleporter pad, level entrance or the ship
+           (the original triggers on entering the object's cell, no button) */
+        {
             unsigned char pcx = (unsigned char)((unsigned int)(px + 8) >> 4);
             unsigned char pcy = (unsigned char)((unsigned int)(py + 8) >> 4);
-            for (i = 0; i < n_teleports; i++) {
-                if (tp_sx[i] != pcx || tp_sy[i] != pcy) continue;
-                sfx_play(SND_TELEPORT);
-                /* warp: place Keen on the destination cell, snap camera */
-                px = (int)tp_dx[i] << 4;
-                py = (int)tp_dy[i] << 4;
-                if (px > (int)mapPW - 16) px = (int)mapPW - 16;
-                if (py > (int)mapPH - 16) py = (int)mapPH - 16;
-                cam_x = cam_y = 0; scroll_y = 0;
-                camera_follow(px + 8 - 124, py + 8 - 92);
-                cam_c8 = cam_x >> 3; cam_r8 = cam_y >> 3;
-                set_scroll_y_full();
-                full_redraw();
-                SMS_setBGScrollX((unsigned char)(0 - cam_x));
-                SMS_setBGScrollY(scroll_y);
-                prev_ks = SMS_getKeysStatus();   /* swallow the held button */
-                break;
-            }
-        }
-
-        /* enter a level? (stand on a city cell, press a button) */
-        if (kp & (PORT_A_KEY_1 | PORT_A_KEY_2)) {
-            unsigned char pcx = (unsigned char)((unsigned int)(px + 8) >> 4);
-            unsigned char pcy = (unsigned char)((unsigned int)(py + 8) >> 4);
-            for (i = 0; i < n_entries; i++) {
-                if (en_mx[i] != pcx || en_my[i] != pcy) continue;
-                if (level_done[en_lvl[i]]) break;      /* done: no re-entry */
-                sfx_play(SND_GOINDOOR);
-                wait_frames(30);
-                cur_level = en_lvl[i];
-                {
-                    static char m[] = "ENTERING LEVEL 00";
-                    m[15] = '0' + cur_level / 10;
-                    m[16] = '0' + cur_level % 10;
-                    if (cur_level < 10) { m[15] = '0' + cur_level; m[16] = 0; }
-                    show_status(m);
+            if (pcx != ow_cx || pcy != ow_cy) {
+                ow_cx = pcx; ow_cy = pcy;
+                for (i = 0; i < n_teleports; i++) {
+                    if (tp_sx[i] != pcx || tp_sy[i] != pcy) continue;
+                    sfx_play(SND_TELEPORT);
+                    wait_frames(20);
+                    ow_warp((int)tp_dx[i] << 4, (int)tp_dy[i] << 4);
+                    break;
                 }
-                game_state = STATE_LEVEL;
-                break;
+                for (i = 0; i < n_entries; i++) {
+                    if (en_mx[i] != pcx || en_my[i] != pcy) continue;
+                    if (en_lvl[i] == 100) {                 /* the ship */
+                        show_ship_box();
+                        ow_moving = 0; build_sprites_ow();
+                    } else if (!level_done[en_lvl[i]]) {
+                        sfx_play(SND_WLDENTER);
+                        wait_frames(30);
+                        cur_level = en_lvl[i];
+                        ow_px = px; ow_py = py;
+                        game_state = STATE_LEVEL;
+                    }
+                    break;
+                }
             }
         }
 
@@ -1597,69 +2041,182 @@ static void run_overworld(void) {
         camera_follow(px + 8 - 124, py + 8 - 92);
         if (pend_col != 0xFFFF) { render_col(pend_col); pend_col = 0xFFFF; }
         if (pend_row != 0xFFFF) { render_row(pend_row); pend_row = 0xFFFF; }
+        frame_ct++;
+        anim_scan();
         build_sprites_ow();
     }
     psg_tone_off(); psg_noise_off();
 }
 
+/* ------------------------------------------------- bank / cart-RAM helpers -- */
+/* (shared with the code overlays, which live in slot 2 themselves) */
+void bank_copy(unsigned char bank, const unsigned char *src, unsigned char *dst, unsigned int n) {
+    unsigned char ob = b2_shadow;
+    SMS_mapROMBank(bank);
+    while (n--) *dst++ = *src++;
+    SMS_mapROMBank(ob);
+}
+
+void bank_tiles(unsigned char bank, const unsigned char *src, unsigned int tile, unsigned int ntiles) {
+    unsigned char ob = b2_shadow;
+    SMS_mapROMBank(bank);
+    SMS_loadTiles(src, tile, ntiles * 32);
+    SMS_mapROMBank(ob);
+}
+
+/* cartridge RAM replaces slot 2 while enabled, so this has to run from the
+   fixed ROM */
+void sram_rw(unsigned char write, unsigned int off, unsigned char *buf, unsigned char n) {
+    unsigned char *m = (unsigned char *)(0x8000u + off);
+    SMS_enableSRAM();
+    if (write) while (n--) *m++ = *buf++;
+    else       while (n--) *buf++ = *m++;
+    SMS_disableSRAM();
+}
+
+static void call_ovl(unsigned char bank, void (*fn)(void)) {
+    unsigned char ob = b2_shadow;
+    map2(bank);
+    fn();
+    map2(ob);
+}
+
+void new_game(void) {
+    unsigned char i;
+    score_hi = score_lo = 0; lives = 3; next_life = 2; ow_px = -1; tele_pending = 0;
+    inv_parts = 0; inv_ammo = 0; inv_pogo = 0; inv_keys = 0;
+    for (i = 0; i < NLEVELS; i++) level_done[i] = 0;
+    game_state = STATE_OW;
+}
+
 /* ---------------------------------------------------------------- ending -- */
-static void run_win(void) {
-    screen_text_begin();
-    print_at(6, 5,  "WITH ALL FOUR PARTS");
-    print_at(6, 7,  "THE BEAN-WITH-BACON");
-    print_at(6, 9,  "MEGAROCKET IS WHOLE!");
-    print_at(6, 12, "KEEN BLASTS OFF HOME");
-    print_at(6, 14, "AND SAVES THE EARTH.");
-    print_at(6, 18, "FINAL SCORE");
-    print_num(18, 18, score_hi, score_lo);
-    SMS_displayOn();
-    sfx_play(SND_LVLDONE);
-    wait_frames(480);
-    /* fresh game state for another run */
-    {
-        unsigned char i;
-        for (i = 0; i < NLEVELS; i++) level_done[i] = 0;
+/* CShipFlySys: the original's scripted flights over LEVEL81.  Speeds are
+   its units (SHIPSPD 16 = 1/2 px per tick) in 8.8; each command lasts
+   t+1 ticks, instant commands one tick -- exactly its queue semantics. */
+#define SC_MOVE   0
+#define SC_WAIT   1
+#define SC_MARK   2
+#define SC_SCROLL 3
+#define SC_FADE   4
+#define SC_END    5
+typedef struct { unsigned char cmd, arg; unsigned int t; } ShipCmd;
+/* MOVE args: 0 up, 1 down, 2 left, 3 right, 4 down-right, 5 up-left */
+static const int ship_dx[6] = { 0, 0, -128, 128, 256, -256 };
+static const int ship_dy[6] = { -128, 64, 0, 0, 102, -102 };
+static const ShipCmd ship_a[] = {            /* Mars -> Earth (EP1_ESEQ) */
+    { SC_MOVE, 0, 60 }, { SC_WAIT, 0, 12 }, { SC_MOVE, 4, 673 }, { SC_WAIT, 0, 25 },
+    { SC_MOVE, 1, 120 }, { SC_WAIT, 0, 18 }, { SC_MARK, 1, 0 }, { SC_SCROLL, 0, 0 },
+    { SC_WAIT, 0, 88 }, { SC_MARK, 0, 0 }, { SC_WAIT, 0, 12 }, { SC_MOVE, 2, 175 },
+    { SC_WAIT, 0, 38 }, { SC_MARK, 2, 0 }, { SC_WAIT, 0, 125 }, { SC_MARK, 0, 0 },
+    { SC_WAIT, 0, 12 }, { SC_MOVE, 3, 175 }, { SC_WAIT, 0, 6 }, { SC_SCROLL, 1, 0 },
+    { SC_MOVE, 1, 116 }, { SC_FADE, 0, 0 } };
+static const ShipCmd ship_b[] = {            /* Earth -> Vorticon mothership */
+    { SC_MOVE, 0, 58 }, { SC_SCROLL, 0, 0 }, { SC_WAIT, 0, 13 }, { SC_MOVE, 2, 208 },
+    { SC_FADE, 0, 0 } };
+
+static void pal_restore(void) {
+    SMS_loadBGPalette(bg_palette);
+    SMS_loadSpritePalette(spr_palette);
+}
+
+static void fade_out(void) {
+    unsigned char k, i, c, r, g, b;
+    for (k = 1; k <= 3; k++) {
+        for (i = 0; i < 16; i++) {
+            c = bg_palette[i]; r = c & 3; g = (c >> 2) & 3; b = (c >> 4) & 3;
+            r = r > k ? r - k : 0; g = g > k ? g - k : 0; b = b > k ? b - k : 0;
+            SMS_setBGPaletteColor(i, r | (g << 2) | (b << 4));
+            c = spr_palette[i]; r = c & 3; g = (c >> 2) & 3; b = (c >> 4) & 3;
+            r = r > k ? r - k : 0; g = g > k ? g - k : 0; b = b > k ? b - k : 0;
+            SMS_setSpritePaletteColor(i, r | (g << 2) | (b << 4));
+        }
+        wait_frames(8);
     }
-    inv_parts = 0; inv_ammo = 0; inv_pogo = 0;
-    score_hi = score_lo = 0;
+    wait_frames(20);
+}
+
+static void run_shipfly(const ShipCmd *sc, int sx, int sy, int camx, int camy) {
+    unsigned char scroll_on = 1, mark = 0, left = 0, ci = 0, base;
+    unsigned int t = sc->t;
+    int fx = 0, fy = 0;
+    load_level(LVL_FLY);
+    px = sx; py = sy;
+    cam_warp(camx, camy);
+    for (;;) {
+        SMS_waitForVBlank();
+        UNSAFE_SMS_copySpritestoSAT();
+        SMS_setBGScrollX((unsigned char)(0 - cam_x));
+        SMS_setBGScrollY(scroll_y);
+        map2(ld->map_bank);
+        if (col_ready) { blit_col(); col_ready = 0; }
+        if (row_ready) { blit_row(); row_ready = 0; }
+
+        switch (sc[ci].cmd) {
+        case SC_MOVE: {
+            unsigned char d = sc[ci].arg;
+            fx += ship_dx[d]; fy += ship_dy[d];
+            px += fx >> 8; fx &= 255;
+            py += fy >> 8; fy &= 255;
+            left = (d == 2 || d == 5);
+            break; }
+        case SC_MARK:   mark = sc[ci].arg; break;
+        case SC_SCROLL: scroll_on = sc[ci].arg; break;
+        case SC_FADE:   fade_out(); SMS_initSprites(); SMS_copySpritestoSAT(); return;
+        }
+        if (t) t--; else { ci++; t = sc[ci].t; }
+        sfx_update();
+        if (scroll_on) camera_follow(px + 8 - 124, py + 4 - 92);
+        if (pend_col != 0xFFFF) { render_col(pend_col); pend_col = 0xFFFF; }
+        if (pend_row != 0xFFFF) { render_row(pend_row); pend_row = 0xFFFF; }
+
+        base = (unsigned char)(VT_SHIP - 256) + (left ? 2 : 0);
+        SMS_initSprites();
+        SMS_addSpriteClipping(px - (int)cam_x,     py - (int)cam_y, base);
+        SMS_addSpriteClipping(px - (int)cam_x + 8, py - (int)cam_y, base + 1);
+        if (mark) {
+            base = (unsigned char)(VT_SHIP - 256) + 2 + mark * 2;
+            SMS_addSpriteClipping(px - (int)cam_x + 4, py - (int)cam_y - 17, base);
+            SMS_addSpriteClipping(px - (int)cam_x + 4, py - (int)cam_y - 9,  base + 1);
+        }
+    }
+}
+
+/* the whole ending, in CEndingEp1's order */
+static void run_win(void) {
+    unsigned char i;
+    /* Keen at his ship on Mars */
+    cur_level = 0;
+    load_level(0);
+    for (i = 0; i < n_entries; i++)
+        if (en_lvl[i] == 100) { ow_warp((int)en_mx[i] << 4, (int)en_my[i] << 4); break; }
+    ow_dir = 3; ow_moving = 0; cur_pframe = 0xFF;
+    build_sprites_ow();
+    wait_frames(30);
+    show_text_box(TXT_E1);
+    dlg_wait(); dlg_close();
+    run_shipfly(ship_a, 6 * 16, 5 * 16, 0, 0);
+    pal_restore();
+    call_ovl(BANK_OVL_FRONT, ovl_end_scene);
+    pal_restore();
+    run_shipfly(ship_b, 48 * 16, 23 * 16, 48 * 16 - 100, 23 * 16 - 160);
+    pal_restore();
+    call_ovl(BANK_OVL_FRONT, ovl_ending_text);
     game_state = STATE_TITLE;
 }
 
-/* ------------------------------------------------------------------ title -- */
-static void run_title(void) {
-    unsigned int kp;
-    SMS_displayOff();
-    SMS_VDPturnOffFeature(VDPFEATURE_LEFTCOLBLANK);
-    SMS_initSprites();
-    SMS_copySpritestoSAT();
-    SMS_VRAMmemsetW(0, 0x0000, 16384);
-    SMS_setBGScrollX(0); SMS_setBGScrollY(0);
-
-    SMS_mapROMBank(BANK_TITLE);
-    SMS_loadTiles(title_tiles, 0, title_ntiles * 32);
-    SMS_loadTileMapArea(0, 0, title_map, 32, 24);
-    SMS_displayOn();
-
-    prev_ks = SMS_getKeysStatus();
-    for (;;) {
-        unsigned int ks;
-        SMS_waitForVBlank();
-        ks = SMS_getKeysStatus();
-        kp = ks & ~prev_ks;
-        prev_ks = ks;
-        if (kp & PORT_A_KEY_1) {
-            if (SMS_getKeysStatus() & PORT_A_KEY_2) {   /* cheat */
-                inv_pogo = 1; inv_ammo = 99;
-            }
-            break;
-        }
+/* Keen finished dying: back to Mars, or game over when out of lives */
+static void run_dead(void) {
+    psg_tone_off(); psg_noise_off();
+    if (lives == 0) {
+        call_ovl(BANK_OVL_FRONT, ovl_gameover);
+    } else {
+        show_lives = 1;
+        game_state = STATE_OW;
     }
-    /* new game */
-    score_hi = score_lo = 0;
-    if (!(inv_ammo == 99 && inv_pogo)) { inv_ammo = 0; inv_pogo = 0; }
-    inv_keys = 0;
-    level_done[1] = level_done[2] = level_done[3] = 0;
-    game_state = STATE_OW;
+}
+
+static void run_title(void) {
+    call_ovl(BANK_OVL_FRONT, ovl_title);
 }
 
 /* ------------------------------------------------------------------- main -- */
@@ -1679,6 +2236,7 @@ void main(void) {
         case STATE_OW:    run_overworld(); break;
         case STATE_LEVEL: run_level();     break;
         case STATE_WIN:   run_win();       break;
+        case STATE_DEAD:  run_dead();      break;
         }
     }
 }

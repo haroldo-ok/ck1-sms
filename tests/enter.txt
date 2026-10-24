@@ -1,0 +1,14 @@
+symbols keen.noi
+run 420
+tap 1
+run 200
+poke px 400 s16
+poke py 624 s16
+run 10
+hold left
+waituntil game_state == 2 120 w1
+hold none
+expect cur_level == 1 w1
+run 150
+screenshot shots/enter1.ppm
+echo === exit: walk to door

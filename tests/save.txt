@@ -1,0 +1,43 @@
+symbols keen.noi
+run 420
+tap 1
+run 150
+poke score_lo 4321 w2
+poke inv_parts 5 w1
+poke inv_ammo 12 w1
+pause
+run 10
+screenshot shots/sv_menu.ppm
+tap down
+run 3
+tap 1
+run 30
+screenshot shots/sv_slot.ppm
+tap down
+run 3
+tap 1
+run 60
+screenshot shots/sv_after.ppm
+poke game_state 0 w1
+poke score_lo 0 w2
+poke inv_parts 0 w1
+poke inv_ammo 0 w1
+run 30
+tap 1
+run 20
+tap 1
+run 30
+tap down
+run 3
+tap 1
+run 30
+screenshot shots/sv_cont.ppm
+tap down
+run 3
+tap 1
+run 60
+print score_lo w2
+print inv_parts w1
+print inv_ammo w1
+print game_state w1
+screenshot shots/sv_loaded.ppm

@@ -1,0 +1,21 @@
+symbols keen.noi
+run 420
+tap 1
+run 100
+poke inv_parts 15 w1
+poke score_hi 3 w2
+poke game_state 3 w1
+run 120
+tap 1
+run 20
+tap 1
+run 300
+screenshot shots/en_1.ppm
+run 400
+screenshot shots/en_2.ppm
+run 300
+screenshot shots/en_3.ppm
+run 300
+screenshot shots/en_4.ppm
+run 400
+screenshot shots/en_5.ppm

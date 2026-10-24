@@ -1,0 +1,17 @@
+symbols keen.noi
+run 420
+tap 1
+run 200
+poke cur_level 7 w1
+poke game_state 2 w1
+run 100
+poke px 300 s16
+poke py 90 s16
+run 20
+screenshot shots/an_1.ppm
+run 3
+screenshot shots/an_2.ppm
+run 3
+screenshot shots/an_3.ppm
+run 3
+screenshot shots/an_4.ppm

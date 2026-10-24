@@ -1,0 +1,27 @@
+symbols keen.noi
+run 60
+tap 1
+run 200
+poke cur_level 1 w1
+poke game_state 2 w1
+run 150
+hold 1
+run 6
+print jframe w1
+print jprep w1
+run 6
+print jframe w1
+run 6
+print jframe w1
+print vy s16
+run 6
+print jframe w1
+print vy s16
+print py s16
+run 6
+print vy s16
+print py s16
+run 10
+print vy s16
+print py s16
+print jumping w1
