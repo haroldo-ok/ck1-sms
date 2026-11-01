@@ -22,6 +22,7 @@
  *               slots that are acquired/released dynamically.
  */
 
+#include <string.h>
 #include "SMSlib.h"
 #include "game_data.h"
 #include "engine.h"
@@ -31,7 +32,20 @@ __sfr __at 0x7F PSGPort;
 /* slot-2 bank shadow: code that temporarily maps another bank (sound data
    fetches) restores whatever the main code had mapped */
 unsigned char b2_shadow;
-static void map2(unsigned char b) { b2_shadow = b; SMS_mapROMBank(b); }
+void map2(unsigned char b) { b2_shadow = b; SMS_mapROMBank(b); }
+void ai_tick(void);                      /* in the AI bank */
+/* Wrappers for the AI bank (they MUST live in fixed ROM: they switch slot 2, so
+   the code doing the switch cannot itself be in slot 2).  ai_lv is the level
+   bank, captured when the tick starts. */
+unsigned char ai_lv;
+unsigned char mflag_a(int x, int y);
+void nt_update_cell_a(unsigned int mx, unsigned int my);
+void ai_run(void) {               /* trampoline: page the AI bank in for one tick */
+    ai_lv = b2_shadow;
+    SMS_mapROMBank(BANK_AI);
+    ai_tick();
+    SMS_mapROMBank(ai_lv);
+}
 
 /* ---------------------------------------------------------------- consts -- */
 
@@ -41,7 +55,9 @@ static void map2(unsigned char b) { b2_shadow = b; SMS_mapROMBank(b); }
 #define VT_BULLET   346            /* 12 tiles, loaded once per level        */
 #define VT_ERAY     358            /* 2 tiles, enemy ray                     */
 #define VT_CHUNK    360            /* 4 tiles, ice chunk                     */
-#define VT_SHIP     364            /* 8 tiles, ending ship + ?/! marks        */
+#define VT_ICEBIT   364            /* 1 tile, ice splinter                   */
+#define VT_ROPE     365            /* 4 tiles, the level-16 rope             */
+#define VT_SHIP     364            /* 8 tiles, ending ship + ?/! marks (not in a level) */
 #define VT_OWKEEN   444            /* 4 tiles, overworld player              */
 #define N_SLOTS     7
 
@@ -61,6 +77,9 @@ static void map2(unsigned char b) { b2_shadow = b; SMS_mapROMBank(b); }
 #define FALL_MAX    832
 #define POGO_STEER   77
 #define BULLET_V    640
+
+/* Commander Genius velocities are 1/32 px per tick; this engine is 8.8 */
+#define EV(u)   ((u) * 8)
 
 #define MAX_ENT     30
 #define MAX_OVR    200
@@ -85,6 +104,13 @@ static void map2(unsigned char b) { b2_shadow = b; SMS_mapROMBank(b); }
 #define ET_BUTLER 3
 #define ET_TANK   4
 #define ET_CANNON0 5                    /* 5..8: vectors (1,-1)(0,-1)(0,1)(-1,-1) */
+#define ET_ROPE   9                     /* level 16: the rope holding the stone */
+/* entity states: 0..5 are per-type AI states, then */
+#define ST_DYING  6
+#define ST_DEAD   7                     /* corpse stays on screen */
+#define ST_GONE   8                     /* removed (crushed by the stone) */
+#define FL_SEEN   1                     /* has been on screen (CG hasbeenonscreen) */
+#define FL_AIR    4                     /* not standing on anything */
 
 /* keen sprite-sheet frame ids (16x24 frames, 6 per row) */
 #define KF_STAND_R  0
@@ -107,13 +133,11 @@ static void map2(unsigned char b) { b2_shadow = b; SMS_mapROMBank(b); }
 #define YF_WALK_L0  4
 #define YF_WALK_R0  6
 #define YF_CRY0     8
-#define YF_DIE      10
-#define YF_DEAD     11
 
 #define F_ANY (F_UP | F_CEIL | F_BLKR | F_BLKL)
 
 /* ---------------------------------------------------------------- state --- */
-static const LevelDesc *ld;
+const LevelDesc *ld;
 unsigned char cur_level;                /* 0=overworld 1..3 */
 unsigned char game_state;
 unsigned char level_done[NLEVELS];
@@ -130,17 +154,17 @@ unsigned char stun_t;            /* frozen-in-ice timer */
 unsigned char jprep, jframe, jtimer, pogo_hold, parts_at_entry;
 unsigned char hint_used, tele_pending, show_lives;
 int ow_px = -1, ow_py;                /* where Keen entered the level (map checkpoint) */
-static const unsigned char hint_msg[17] =   /* level -> TXT_HINT* string id */
+const unsigned char hint_msg[17] =   /* level -> TXT_HINT* string id */
     { 0, 0, TXT_HINT2, 0, 0, 0, TXT_HINT6, 0, 0, TXT_HINT9, TXT_HINT10,
       TXT_HINT11, TXT_HINT12, 0, 0, TXT_HINT15, 0 };
-static const unsigned char walk_seq[4] = { 0, 1, 2, 1 };   /* frames 1,2,3,2 */
+const unsigned char walk_seq[4] = { 0, 1, 2, 1 };   /* frames 1,2,3,2 */
 
 /* map access (valid while ld->map_bank mapped) */
-static const unsigned char *map_rom;
-static const unsigned int  *mtdef_rom;
-static unsigned char flags_ram[256];
-static unsigned int  mapW, mapH;        /* in metatiles */
-static unsigned int  mapPW, mapPH;      /* in pixels    */
+const unsigned char *map_rom;
+const unsigned int  *mtdef_rom;
+unsigned char flags_ram[256];
+unsigned int  mapW, mapH;        /* in metatiles */
+unsigned int  mapPW, mapPH;      /* in pixels    */
 
 /* item overrides: cells whose metatile changed after pickup. The list is
    kept SORTED BY ROW with ovr_row0[r] = index of row r's first entry, so
@@ -148,11 +172,11 @@ static unsigned int  mapPW, mapPH;      /* in pixels    */
    list -- with 100+ collected items a per-cell full scan made every
    scroll strip cost tens of thousands of cycles (the big-level lag). */
 #define MAX_OVR_ROWS 96
-static unsigned char ovr_mx[MAX_OVR], ovr_my[MAX_OVR], ovr_mt[MAX_OVR];
-static unsigned char ovr_row0[MAX_OVR_ROWS + 1];
-static unsigned char n_ovr;
+unsigned char ovr_mx[MAX_OVR], ovr_my[MAX_OVR], ovr_mt[MAX_OVR];
+unsigned char ovr_row0[MAX_OVR_ROWS + 1];
+unsigned char n_ovr;
 
-static void ovr_add(unsigned char mx, unsigned char my, unsigned char mt) {
+void ovr_add(unsigned char mx, unsigned char my, unsigned char mt) {
     unsigned char i, pos;
     if (n_ovr >= MAX_OVR || my >= MAX_OVR_ROWS) return;
     pos = ovr_row0[my + 1];                 /* insert at end of my's bucket */
@@ -167,82 +191,208 @@ static void ovr_add(unsigned char mx, unsigned char my, unsigned char mt) {
 }
 
 /* items copied to RAM at load */
-static unsigned char it_mx[MAX_OVR], it_my[MAX_OVR], it_kind[MAX_OVR],
+unsigned char it_mx[MAX_OVR], it_my[MAX_OVR], it_kind[MAX_OVR],
                      it_restore[MAX_OVR], it_taken[MAX_OVR];
-static unsigned char n_items;
-static unsigned char it_lo;               /* cached window start (sorted mx) */
+unsigned char n_items;
+unsigned char it_lo;               /* cached window start (sorted mx) */
+unsigned char it_c0, it_c1, it_r0, it_r1;   /* cells last scanned */
 
 /* overworld entries (one per city cell) */
-static unsigned char en_mx[MAX_ENTRIES], en_my[MAX_ENTRIES],
+unsigned char en_mx[MAX_ENTRIES], en_my[MAX_ENTRIES],
                      en_lvl[MAX_ENTRIES], en_done[MAX_ENTRIES];
-static unsigned char n_entries;
+unsigned char n_entries;
 
 /* world-map teleporters: src cell -> dest cell (bidirectional pairs) */
 #define MAX_TELEPORTS 4
-static unsigned char tp_sx[MAX_TELEPORTS], tp_sy[MAX_TELEPORTS],
+unsigned char tp_sx[MAX_TELEPORTS], tp_sy[MAX_TELEPORTS],
                      tp_dx[MAX_TELEPORTS], tp_dy[MAX_TELEPORTS];
-static unsigned char n_teleports;
+unsigned char n_teleports;
 
 /* doors (per level): color 0..3 = Y R G B */
-static unsigned char do_mx[MAX_DOORS], do_my[MAX_DOORS], do_col[MAX_DOORS],
+unsigned char do_mx[MAX_DOORS], do_my[MAX_DOORS], do_col[MAX_DOORS],
                      do_restore[MAX_DOORS], do_open[MAX_DOORS];
-static unsigned char n_doors;
+unsigned char n_doors;
 
 /* exit cells */
-static unsigned char ex_mx[MAX_EXITS], ex_my[MAX_EXITS];
-static unsigned char n_exits;
+unsigned char ex_mx[MAX_EXITS], ex_my[MAX_EXITS];
+unsigned char n_exits;
 
 /* camera */
-static unsigned int cam_x, cam_y;
-static unsigned int cam_c8, cam_r8;       /* cam_x>>3, cam_y>>3 */
-static unsigned int pend_col, pend_row;   /* 0xFFFF = none */
-static unsigned int pend_col_camr8;       /* row base captured with column   */
+unsigned int cam_x, cam_y;
+unsigned int cam_c8, cam_r8;       /* cam_x>>3, cam_y>>3 */
+unsigned int pend_col, pend_row;   /* 0xFFFF = none */
+unsigned int pend_col_camr8;       /* row base captured with column   */
 
 /* player */
 int px, py;                             /* world pixel, sprite top-left      */
 int vx, vy;                     /* 8.8                               */
-static int  sx_acc, sy_acc;             /* subpixel accumulators             */
+int  sx_acc, sy_acc;             /* subpixel accumulators             */
 unsigned char dir_right, on_ground, jumping, pogoing, pogo_squat;
 unsigned char shoot_timer, exiting, dying;
-static unsigned int  seq_timer;
-static unsigned char pframe, cur_pframe, anim_t;
-static unsigned char fall_snd_on;
+unsigned int  seq_timer;
+unsigned char pframe, cur_pframe, anim_t;
+unsigned char fall_snd_on;
+unsigned int  exit_cut;            /* world x past which Keen is hidden in the doorway */
+unsigned char kbuf[192];           /* Keen's frame, clipped at the door */
+unsigned char pal_mode;                   /* 1 = 50 Hz console */
+unsigned char pal_ct;
 
 /* bullet */
-static unsigned char b_active, b_hit, b_timer, b_right;
-static int b_px, b_py;
+unsigned char b_active, b_hit, b_timer, b_right;
+int b_px, b_py;
 
 /* entities */
-static unsigned char y_n;
-static unsigned char e_type[MAX_ENT];
-static int  y_px[MAX_ENT], y_py[MAX_ENT];
-static int  y_vx[MAX_ENT], y_vy[MAX_ENT];
-static int  y_sx[MAX_ENT], y_sy[MAX_ENT];
-static unsigned char  y_state[MAX_ENT];   /* 0 alive 1 stunned 2 dying 3 dead */
-static unsigned int   y_t[MAX_ENT];
-static unsigned char  y_hop[MAX_ENT];
-static unsigned char  y_hp[MAX_ENT];
-static unsigned char  y_frame[MAX_ENT];   /* (type<<4)|frame key for streaming */
-static unsigned char  y_slot[MAX_ENT];    /* 0..N_SLOTS-1 or 0xFF */
-static unsigned char  y_pg[MAX_ENT];      /* y_px>>8: byte prefilter page */
-static unsigned char  cam_pg;             /* cam_x>>8, refreshed per frame */
-static unsigned char  near_list[MAX_ENT]; /* indices of page-near entities */
-static unsigned char  n_near;             /* entries in near_list */
-static unsigned char  near_timer;         /* frames since last rebuild */
-static unsigned char  near_pg;            /* cam_pg at last rebuild */
-static unsigned char  slot_owner[N_SLOTS];
-static unsigned char  slot_vframe[N_SLOTS];
-static unsigned char  slot_part[N_SLOTS];     /* 12-tile art: 1 = first half loaded */
-static unsigned char  slot_pkey[N_SLOTS];
+/* Entities are an array of structs. The per-frame AI copies the one being
+   updated into the global E (memcpy in, the first ENT_DIRTY bytes out):
+   SDCC addresses a global's fields directly (ld hl,(nn)), while every
+   indexed y_px[i]-style access costs ~100 cycles of address arithmetic --
+   the copy pays for itself several times over. */
+typedef struct {
+    int px, py;                  /* world pixel, top-left of the drawn box     */
+    int vx, vy;                  /* 8.8 (CG xinertia/yinertia x 8)              */
+    int sx, sy;                  /* subpixel accumulators                      */
+    unsigned int t;              /* dist_traveled / dist_to_travel             */
+    unsigned char state;         /* per-type AI state (ST_* when dying)        */
+    unsigned char tm;            /* timer                                      */
+    unsigned char an;            /* animtimer / lookposition                   */
+    unsigned char lk;            /* looktimes                                  */
+    unsigned char wf;            /* walkframe / frame                          */
+    unsigned char ks;            /* keen-on-same-level timer                   */
+    unsigned char dir;           /* movedir / xDirection: 0 left 1 right 2 centre */
+    unsigned char jt;            /* jump time / tank xDirection                */
+    unsigned char frame;         /* sprite frame in the type's sheet           */
+    unsigned char fl;            /* FL_*, garg "about to charge"               */
+    /* --- not written back by ent_update --- */
+    unsigned char hp, type;
+    unsigned char slot;          /* 0..N_SLOTS-1 or 0xFF                       */
+    unsigned char pad;
+} Ent;
+#define ENT_DIRTY 24
+unsigned char y_n;
+Ent ents[MAX_ENT];
+Ent E;                             /* entity being updated */
+/* ---- enemy AI constants (CG states and frames) and shared state ---- */
+#define YF_DIE      10
+#define YF_DEAD     11
+#define LEFT_   0
+#define RIGHT_  1
+#define CENTER_ 2
+#define Y_LOOK   0
+#define Y_MOVE   1
+#define Y_STUN   2
+#define YF_LOOK_L 1
+#define YF_STAND  2
+#define YF_LOOK_R 3
+#define YF_WALK_LEFT  4
+#define YF_WALK_RIGHT 6
+#define YF_STUN   8
+#define YF_DYING  10
+#define YF_DEAD   11
+#define G_LOOK   0
+#define G_MOVE   1
+#define G_CHARGE 2
+#define G_JUMP   3
+#define GF_STAND 0
+#define GF_WALK_RIGHT 4
+#define GF_WALK_LEFT  6
+#define GF_DYING 8
+#define GF_DEAD  9
+#define FL_ABOUT 2                    /* about_to_charge */
+#define V_WALK 0
+#define V_JUMP 1
+#define V_LOOK 2
+#define VF_WALK_LEFT  0
+#define VF_WALK_RIGHT 4
+#define VF_LOOK  8
+#define VF_JUMP_R 10
+#define VF_JUMP_L 11
+#define VF_DYING 12
+#define B_TURN 0
+#define B_WALK 1
+#define B_FALL 2
+#define BF_WALK_RIGHT 0
+#define BF_WALK_LEFT  4
+#define BF_TURN_LEFT  8
+#define BF_TURN_RIGHT 9
+#define T_WALK  0
+#define T_TURN  1
+#define T_WAIT  2
+#define T_WAITLOOK 3
+#define T_LOOK  4
+#define TF_WALK_RIGHT 0
+#define TF_WALK_LEFT  4
+#define TF_LOOK 8
+#define STONE_W 9
+#define STONE_H 2
+Ent *rope_ent;
+unsigned char rope_rows;                      /* 0 = no rope level  */
+unsigned int  rope_sx, rope_sy;               /* stone top-left, tiles */
+unsigned char rope_bg;                        /* "changestoneblock" metatile */
+unsigned char rope_map[STONE_H + 4][110];     /* RAM copy of the rows it crosses */
+unsigned char shake_t;                        /* screen shake ticks */
+unsigned char flash_t;                        /* white flash when a vorticon dies */
 
-/* projectiles: 2 ice chunks + 2 enemy rays */
-static unsigned char pj_on[4];            /* 0 off, 1 chunk, 2 eray */
-static int pj_x[4], pj_y[4], pj_vx[4], pj_vy[4];
 
-static unsigned char rng;
-static unsigned char frame_ct;               /* free-running frame counter */
-static unsigned char scroll_y;          /* cam_y % 224, kept incrementally */
-static unsigned char anim_ph;           /* walk anim phase 0..2 */
+/* er_x/er_y = entity position relative to the camera. A two-line helper,
+   but it runs for every near entity twice a frame and SDCC spilled it
+   through the stack at ~900 cycles; this is ~110. sdcccall(1): ep in HL. */
+int er_x, er_y;
+void ent_rel(const Ent *ep) __naked {
+    (void)ep;
+__asm
+    ld   e, (hl)
+    inc  hl
+    ld   d, (hl)
+    inc  hl
+    push hl
+    ld   hl, (_cam_x)
+    ex   de, hl
+    or   a, a
+    sbc  hl, de
+    ld   (_er_x), hl
+    pop  hl
+    ld   e, (hl)
+    inc  hl
+    ld   d, (hl)
+    ld   hl, (_cam_y)
+    ex   de, hl
+    or   a, a
+    sbc  hl, de
+    ld   (_er_y), hl
+    ret
+__endasm;
+}
+Ent *near_list[MAX_ENT];           /* entities near the camera */
+unsigned char  n_near;             /* entries in near_list */
+Ent *vis_list[MAX_ENT];            /* near ones that may be on screen */
+unsigned char  n_vis;
+unsigned char  near_timer;         /* frames since last rebuild */
+Ent *slot_owner[N_SLOTS];
+unsigned char  slot_vframe[N_SLOTS];
+unsigned char  slot_part[N_SLOTS];     /* 12-tile art: 1 = first half loaded */
+unsigned char  slot_pkey[N_SLOTS];
+
+/* projectiles: ice chunks and enemy rays (CG objects), ice splinters */
+#define N_PROJ 6
+#define N_BITS 8
+#define PJ_CHUNK 1
+#define PJ_RAY   2
+#define PJ_ZAP   3                         /* a ray's impact flash          */
+unsigned char pj_on[N_PROJ];       /* 0 off, PJ_* */
+int pj_x[N_PROJ], pj_y[N_PROJ], pj_vx[N_PROJ], pj_vy[N_PROJ];
+int pj_sx[N_PROJ], pj_sy[N_PROJ];
+unsigned char pj_t[N_PROJ];
+int bit_x[N_BITS], bit_y[N_BITS];
+signed char bit_dx[N_BITS], bit_dy[N_BITS];
+unsigned char bit_t[N_BITS];
+
+unsigned char rng;
+unsigned char frame_ct;               /* free-running frame counter */
+unsigned int perf_loops, perf_vbl;           /* game-loop iterations vs. frames */
+unsigned char perf_on;
+void perf_isr(void) { if (perf_on) perf_vbl++; }
+unsigned char scroll_y;          /* cam_y % 224, kept incrementally */
+unsigned char anim_ph;           /* walk anim phase 0..2 */
 
 
 
@@ -250,7 +400,7 @@ static unsigned char anim_ph;           /* walk anim phase 0..2 */
    (SMS_getKeysPressed loses edges whenever a game frame overruns and the
    ISR refreshes its previous/current pair before the loop reads it) */
 unsigned int prev_ks;
-static unsigned char jump_buf;          /* buffered jump press, frames */
+unsigned char jump_buf;          /* buffered jump press, frames */
 #define JUMP_BUF_FRAMES 5
 
 /* ------------------------------------------------------------------ sfx --- */
@@ -261,20 +411,16 @@ static unsigned char jump_buf;          /* buffered jump press, frames */
    of ~44/s (44 ticks per 60 frames via an accumulator). One channel,
    with the original priority rule: a new sound only replaces the
    current one if its priority is at least as high. */
-static const unsigned int *snd_p;
-static unsigned char snd_on, snd_pri_cur, snd_acc;
+const unsigned int *snd_p;
+unsigned char snd_on, snd_pri_cur, snd_acc;
 
-static void psg_tone(unsigned int period, unsigned char att) {
+void psg_tone(unsigned int period, unsigned char att) {
     PSGPort = 0xC0 | (period & 0x0F);        /* ch2 tone latch */
     PSGPort = (period >> 4) & 0x3F;
     PSGPort = 0xD0 | (att & 0x0F);           /* ch2 volume     */
 }
-static void psg_tone_off(void)  { PSGPort = 0xDF; }
-static void psg_noise(unsigned char mode, unsigned char att) {
-    PSGPort = 0xE0 | mode;                   /* ch3 noise      */
-    PSGPort = 0xF0 | (att & 0x0F);
-}
-static void psg_noise_off(void) { PSGPort = 0xFF; }
+void psg_tone_off(void)  { PSGPort = 0xDF; }
+void psg_noise_off(void) { PSGPort = 0xFF; }
 
 void sfx_play(unsigned char id) {
     unsigned char p = snd_pri[id];
@@ -305,12 +451,12 @@ void sfx_update(void) {
     }
 }
 
-/* precomputed my*mapW offsets (mapH <= 69) */
-static unsigned int row_off[96];
+/* precomputed map row pointers (map + my*mapW; mapH <= 77) */
+const unsigned char *row_off[96];
 
 /* --------------------------------------------------------------- map query - */
-static unsigned char cell_mt(unsigned int mx, unsigned int my) {
-    unsigned char m = map_rom[row_off[my] + mx];
+unsigned char cell_mt(unsigned int mx, unsigned int my) {
+    unsigned char m = row_off[my][mx];
     unsigned char i, e;
     e = ovr_row0[(unsigned char)my + 1];
     for (i = ovr_row0[(unsigned char)my]; i < e; i++)
@@ -319,27 +465,98 @@ static unsigned char cell_mt(unsigned int mx, unsigned int my) {
 }
 
 /* flags at world pixel; outside map: sides/top solid, bottom open */
-static unsigned char n_open_doors;      /* fast skip when none open */
-static unsigned char door_open_at(unsigned char cx, unsigned char cy) {
+unsigned char n_open_doors;      /* fast skip when none open */
+unsigned char door_open_at(unsigned char cx, unsigned char cy) {
     unsigned char i;
     for (i = 0; i < n_doors; i++)
         if (do_open[i] && do_mx[i] == cx && do_my[i] == cy) return 1;
     return 0;
 }
-static unsigned char mflag(int wx, int wy) {
-    unsigned int mx, my;
-    if (wx < 0 || wy < 0) return F_ANY;
-    mx = (unsigned int)wx >> 4;
-    my = (unsigned int)wy >> 4;
-    if (mx >= mapW) return F_ANY;
-    if (my >= mapH) return 0;
-    {
-        unsigned char f = flags_ram[map_rom[row_off[my] + mx]];
-        if ((f & F_ANY) && n_open_doors &&
-            door_open_at((unsigned char)mx, (unsigned char)my))
-            return 0;
-        return f;
-    }
+/* the slow path of mflag (only when a door has been opened): an open
+   door cell reads as empty */
+unsigned int mf_mx, mf_my;
+unsigned char mflag_door(unsigned char f) {
+    return door_open_at((unsigned char)mf_mx, (unsigned char)mf_my) ? 0 : f;
+}
+
+/* Collision flags of the metatile under world pixel (wx, wy); outside the
+   map the sides and top are solid and the bottom is open. This is the
+   engine's hottest leaf (every entity and player probe), so it is
+   hand-written: SDCC's version spent ~650 cycles a call shuffling the
+   16-bit shifts through the stack frame; this one takes ~190.
+   sdcccall(1): wx in HL, wy in DE, result in A. */
+unsigned char mflag(int wx, int wy) __naked {
+    (void)wx; (void)wy;
+__asm
+    ; bc = mx = (unsigned)wx >> 4  (wx < 0 gives mx >= 0x800)
+    ld   a, l
+    srl  h
+    rra
+    srl  h
+    rra
+    srl  h
+    rra
+    srl  h
+    rra
+    ld   c, a
+    ld   b, h
+    ld   hl, (_mapW)
+    ld   a, c
+    sub  a, l
+    ld   a, b
+    sbc  a, h
+    jr   NC, 00190$             ; mx >= mapW: solid wall
+    bit  7, d
+    jr   NZ, 00190$             ; wy < 0: solid ceiling
+    ; de = my = wy >> 4
+    ld   a, e
+    srl  d
+    rra
+    srl  d
+    rra
+    srl  d
+    rra
+    srl  d
+    rra
+    ld   e, a
+    ld   hl, (_mapH)
+    sub  a, l
+    ld   a, d
+    sbc  a, h
+    jr   NC, 00191$             ; my >= mapH: open below the map
+    ld   hl, #_row_off
+    add  hl, de
+    add  hl, de
+    ld   a, (hl)
+    inc  hl
+    ld   h, (hl)
+    ld   l, a                   ; hl = row pointer
+    add  hl, bc
+    ld   l, (hl)                ; metatile index
+    ld   h, #0
+    push de
+    ld   de, #_flags_ram
+    add  hl, de
+    pop  de
+    ld   a, (hl)                ; flags
+    ld   l, a
+    and  a, #0x0F               ; any solid bit? (F_ANY)
+    ld   a, l
+    ret  Z
+    ld   a, (_n_open_doors)
+    or   a, a
+    ld   a, l
+    ret  Z
+    ld   (_mf_mx), bc
+    ld   (_mf_my), de
+    jp   _mflag_door
+00190$:
+    ld   a, #0x0F
+    ret
+00191$:
+    xor  a, a
+    ret
+__endasm;
 }
 
 /* -------------------------------------------------------------- NT strips -- */
@@ -354,45 +571,55 @@ static unsigned char mflag(int wx, int wy) {
 __sfr __at 0xBF VDPCtrlPort;              /* raw ports: the blits below   */
 __sfr __at 0xBE VDPDataPort;              /* run in vblank and must be    */
                                           /* fast, not paced              */
-static unsigned int  colbuf[28];       /* tile words                     */
-static unsigned int  colbuf_a[28];     /* their VRAM addresses           */
-static unsigned char colbuf_n, col_ready;
-static unsigned int  rowbuf[32];
-static unsigned int  rowbuf_a0, rowbuf_a1;  /* run starts (a1 = after NT wrap) */
-static unsigned char rowbuf_n1, rowbuf_n, row_ready;
+unsigned int  colbuf[28];       /* tile words                     */
+unsigned int  colbuf_a[28];     /* their VRAM addresses           */
+unsigned char colbuf_n, col_ready;
+unsigned int  rowbuf[32];
+unsigned int  rowbuf_a0, rowbuf_a1;  /* run starts (a1 = after NT wrap) */
+unsigned char rowbuf_n1, rowbuf_n, row_ready;
 
-static void render_col(unsigned int wc) {
-    unsigned char r, sub;
-    unsigned int wr;
+void render_col(unsigned int wc) {
+    unsigned char n, nty, odd;
+    unsigned int wr, addr, mx;
     const unsigned char *mrow;
-    const unsigned int  *mtsub;
-    unsigned char nty;
-    unsigned int addr;
+    unsigned int *pb, *pa;
     colbuf_n = 0;
     if (wc >= (mapW << 1)) return;
-    wr    = pend_col_camr8;
-    nty   = (unsigned char)(wr % 28);
-    addr  = SMS_PNTAddress | ((((unsigned int)nty << 5) + (wc & 31)) << 1);
-    sub   = wc & 1;
-    mrow  = map_rom + row_off[wr >> 1] + (wc >> 1);
-    mtsub = mtdef_rom + sub + ((wr & 1) << 1);
-    for (r = 0; r < 25; r++, wr++) {
-        unsigned char m;
-        if (wr >= (mapH << 1)) break;
-        m = *mrow;
-        if (n_ovr) m = cell_mt(wc >> 1, wr >> 1);
-        colbuf[r]   = mtsub[(unsigned int)m << 2];
-        colbuf_a[r] = addr;
-        colbuf_n++;
-        if (++nty == 28) { nty = 0; addr -= 28u * 64u; }
-        addr += 64;
-        if (wr & 1) { mrow += mapW; mtsub -= 2; }
-        else        { mtsub += 2; }
+    wr  = pend_col_camr8;
+    if (wr >= (mapH << 1)) return;
+    nty = (unsigned char)wr;                  /* wr < 2*77: no division needed */
+    while (nty >= 28) nty -= 28;
+    addr = SMS_PNTAddress | ((((unsigned int)nty << 5) + (wc & 31)) << 1);
+    mx   = wc >> 1;
+    mrow = row_off[wr >> 1] + mx;
+    n = (unsigned char)((mapH << 1) - wr);
+    if (n > 25) n = 25;
+    colbuf_n = n;
+    pb = colbuf; pa = colbuf_a;
+    odd = wr & 1;
+    /* one metatile (two tile rows) per pass */
+    for (;;) {
+        unsigned char m = *mrow;
+        const unsigned int *mt;
+        if (n_ovr) m = cell_mt(mx, wr >> 1);
+        mt = mtdef_rom + ((unsigned int)m << 2) + (wc & 1);
+        if (!odd) {
+            *pb++ = mt[0]; *pa++ = addr;
+            addr += 64; if (++nty == 28) { nty = 0; addr -= 28u * 64u; }
+            if (!--n) break;
+            wr++;
+        }
+        odd = 0;
+        *pb++ = mt[2]; *pa++ = addr;
+        addr += 64; if (++nty == 28) { nty = 0; addr -= 28u * 64u; }
+        if (!--n) break;
+        wr++;
+        mrow += mapW;
     }
     col_ready = 1;
 }
 
-static void blit_col(void) {
+void blit_col(void) {
     /* little-endian int buffers stream in exactly the low-byte-first
        order the VDP ports want */
     const unsigned char *pa = (const unsigned char *)colbuf_a;
@@ -406,37 +633,60 @@ static void blit_col(void) {
     }
 }
 
-static void render_row(unsigned int wr) {
-    unsigned char c, sub;
-    unsigned int wc;
+void render_row(unsigned int wr) {
+    unsigned char c, n, nmt, nty, my;
+    unsigned int wc, mx0;
     const unsigned char *mrow;
     const unsigned int  *mtsub;
     unsigned char ntx0;
-    unsigned int rowbase;
+    unsigned int rowbase, *pb;
+    unsigned char mts[18];
     rowbuf_n = 0;
     if (wr >= (mapH << 1)) return;
-    rowbase = SMS_PNTAddress | (((unsigned int)(wr % 28)) << 6);
+    nty = (unsigned char)wr;                  /* wr < 2*77: no division needed */
+    while (nty >= 28) nty -= 28;
+    rowbase = SMS_PNTAddress | ((unsigned int)nty << 6);
     wc      = cam_c8 + 1;
     ntx0    = (unsigned char)(wc & 31);
     rowbuf_a0 = rowbase + ((unsigned int)ntx0 << 1);
     rowbuf_a1 = rowbase;                    /* run 2: after the NT wrap */
     rowbuf_n1 = 32 - ntx0;                  /* entries before the wrap  */
-    sub   = (wr & 1) << 1;
-    mrow  = map_rom + row_off[wr >> 1];
-    mtsub = mtdef_rom + sub;
-    for (c = 0; c < 32; c++, wc++) {
-        unsigned char m;
-        if (wc >= (mapW << 1)) break;
-        m = mrow[wc >> 1];
-        if (n_ovr) m = cell_mt(wc >> 1, wr >> 1);
-        rowbuf[c] = mtsub[((unsigned int)m << 2) + (wc & 1)];
-        rowbuf_n++;
+    if (wc >= (mapW << 1)) return;
+    n = (unsigned char)((mapW << 1) - wc);
+    if (n > 32) n = 32;
+    /* the row's metatiles, then the item/door overrides patched in */
+    my   = (unsigned char)(wr >> 1);
+    mx0  = wc >> 1;
+    nmt  = (unsigned char)(((wc + n - 1) >> 1) - mx0 + 1);
+    mrow = row_off[my] + mx0;
+    for (c = 0; c < nmt; c++) mts[c] = mrow[c];
+    if (n_ovr) {
+        unsigned char i = ovr_row0[my + 1], e = ovr_row0[my];
+        while (i > e) {                     /* backwards: first entry wins */
+            unsigned char d;
+            i--;
+            d = (unsigned char)(ovr_mx[i] - (unsigned char)mx0);
+            if (d < nmt) mts[d] = ovr_mt[i];
+        }
     }
+    mtsub = mtdef_rom + ((wr & 1) << 1);
+    pb = rowbuf;
+    c = 0;
+    if (wc & 1) {                           /* starts on a right half */
+        *pb++ = mtsub[((unsigned int)mts[0] << 2) + 1];
+        c = 1;
+    }
+    for (; c < n; c += 2) {
+        const unsigned int *mt = mtsub + ((unsigned int)mts[(c + (wc & 1)) >> 1] << 2);
+        *pb++ = mt[0];
+        if (c + 1 < n) *pb++ = mt[1];
+    }
+    rowbuf_n = n;
     if (rowbuf_n1 > rowbuf_n) rowbuf_n1 = rowbuf_n;
     row_ready = 1;
 }
 
-static void blit_row(void) {
+void blit_row(void) {
     const unsigned char *pt = (const unsigned char *)rowbuf;
     unsigned char c;
     VDPCtrlPort = (unsigned char)rowbuf_a0;
@@ -455,7 +705,7 @@ static void blit_row(void) {
     }
 }
 
-static void nt_write_cell(unsigned int wc, unsigned int wr) {
+void nt_write_cell(unsigned int wc, unsigned int wr) {
     unsigned char m = cell_mt(wc >> 1, wr >> 1);
     unsigned int t = mtdef_rom[((unsigned int)m << 2) + ((wr & 1) << 1) + (wc & 1)];
     SMS_setTileatXY(wc & 31, wr % 28, t);
@@ -463,7 +713,7 @@ static void nt_write_cell(unsigned int wc, unsigned int wr) {
 
 /* paced variant for use OUTSIDE vblank (teleporter full redraws happen
    with the display on; raw back-to-back port writes would be dropped) */
-static void blit_col_paced(void) {
+void blit_col_paced(void) {
     unsigned char r;
     for (r = 0; r < colbuf_n; r++) {
         SMS_setAddr(colbuf_a[r]);
@@ -471,7 +721,7 @@ static void blit_col_paced(void) {
     }
 }
 
-static void full_redraw(void) {
+void full_redraw(void) {
     unsigned int c;
     pend_col_camr8 = cam_r8;
     for (c = 0; c <= 32; c++) {
@@ -483,9 +733,9 @@ static void full_redraw(void) {
 }
 
 /* update camera to follow (cx,cy) target; queue entering strips */
-static void set_scroll_y_full(void) { scroll_y = (unsigned char)(cam_y % 224); }
+void set_scroll_y_full(void) { scroll_y = (unsigned char)(cam_y % 224); }
 
-static void camera_follow(int tx, int ty) {
+void camera_follow(int tx, int ty) {
     unsigned int nc8, nr8;
     int d;
     if (tx < 0) tx = 0;
@@ -510,43 +760,59 @@ static void camera_follow(int tx, int ty) {
     pend_col_camr8 = cam_r8;
 }
 
+/* per-frame camera: never more than 8px a frame, because the ring buffer
+   gets exactly one new column and one new row per frame. Keen never moves
+   that fast; this only guards against a jump (e.g. a teleport within the
+   view) silently skipping a strip. Snaps go through cam_warp instead. */
+void camera_track(int tx, int ty) {
+    int d = tx - (int)cam_x;
+    if (d > 8) tx = (int)cam_x + 8; else if (d < -8) tx = (int)cam_x - 8;
+    d = ty - (int)cam_y;
+    if (d > 8) ty = (int)cam_y + 8; else if (d < -8) ty = (int)cam_y - 8;
+    camera_follow(tx, ty);
+}
+
 /* rewrite the NT tiles of a metatile cell, only where resident in the
    ring buffer (cols cam_c8+1..cam_c8+32, rows cam_r8..cam_r8+24) */
-static void nt_sub_update(unsigned int wc, unsigned int wr) {
+void nt_sub_update(unsigned int wc, unsigned int wr) {
     if (wc < cam_c8 + 1 || wc > cam_c8 + 32) return;
     if (wr < cam_r8     || wr > cam_r8 + 24) return;
     nt_write_cell(wc, wr);
 }
-static void nt_update_cell(unsigned int mx, unsigned int my) {
+void nt_update_cell(unsigned int mx, unsigned int my) {
     unsigned int wc = mx << 1, wr = my << 1;
     nt_sub_update(wc, wr);     nt_sub_update(wc + 1, wr);
     nt_sub_update(wc, wr + 1); nt_sub_update(wc + 1, wr + 1);
 }
 
+unsigned char mflag_a(int x, int y) {
+    unsigned char r;
+    SMS_mapROMBank(ai_lv);
+    r = mflag(x, y);
+    SMS_mapROMBank(BANK_AI);
+    return r;
+}
+void nt_update_cell_a(unsigned int mx, unsigned int my) {
+    SMS_mapROMBank(ai_lv);
+    nt_update_cell(mx, my);
+    SMS_mapROMBank(BANK_AI);
+}
+
 /* --------------------------------------------------------------- loading --- */
-static void font_load(void) {
+void font_load(void) {
+    unsigned char ob = b2_shadow;
+    SMS_mapROMBank(BANK_TXT);
     SMS_load1bppTiles(font_1bpp, 0, 59 * 8, 0, 15);
+    SMS_mapROMBank(ob);
     SMS_configureTextRenderer(-32);
 }
 
-static void print_at(unsigned char x, unsigned char y, const char *s) {
-    SMS_setNextTileatXY(x, y);
-    SMS_print((const unsigned char *)s);
-}
 
-static char numbuf[6];
-static void print_num(unsigned char x, unsigned char y, unsigned int hi, unsigned int lo) {
-    /* prints hi*10000+lo as 6+ digits (hi<=6553) */
-    unsigned char i;
-    unsigned long v = (unsigned long)hi * 10000UL + lo;
-    for (i = 0; i < 6; i++) { numbuf[5 - i] = '0' + (unsigned char)(v % 10); v /= 10; }
-    SMS_setNextTileatXY(x, y);
-    for (i = 0; i < 6; i++) { unsigned char c = numbuf[i]; SMS_setTile((unsigned int)(c - 32)); }
-}
+char numbuf[6];
 
-static const unsigned int kind_score[15] =       /* ship parts: 10000; cards give none */
+const unsigned int kind_score[15] =       /* ship parts: 10000; cards give none */
     { 100, 200, 500, 1000, 5000, 0, 0, 0, 0, 0, 0, 10000, 10000, 10000, 10000 };
-static void add_score(unsigned char kind) {
+void add_score(unsigned char kind) {
     score_lo += kind_score[kind];
     while (score_lo >= 10000) { score_lo -= 10000; score_hi++; }
     if (score_hi >= next_life) {                 /* extra Keen every 20000 */
@@ -561,48 +827,236 @@ static void add_score(unsigned char kind) {
    the end of a frame; anim_upload() sends them in a VBlank that carries no
    other art burst. */
 #define MAX_ANIM 80
-static unsigned char an_cur[MAX_ANIM];
+typedef struct {
+    unsigned int tile;                 /* VRAM tile index                 */
+    const unsigned char *art;          /* frame 0 of its art (bank 3)     */
+    unsigned char m;                   /* member offset in its tile group */
+    unsigned char cur;                 /* phase currently in VRAM         */
+} AnimTile;
+AnimTile an[MAX_ANIM];
 unsigned char an_n, an_cursor, ab_n;
-static const unsigned char *an_list;
-static unsigned int ab_tile[6];
-static const unsigned char *ab_src[6];
+unsigned char an_done_step;   /* step whose frames are all loaded */
+unsigned int ab_tile[6];
+const unsigned char *ab_src[6];
 
-static void anim_init(void) {
+void anim_init(void) {
     unsigned char i;
-    an_list = ld->anim; an_n = ld->nanim;
+    const unsigned char *q = ld->anim;
+    AnimTile *a = an;
+    an_n = ld->nanim;
     if (an_n > MAX_ANIM) an_n = MAX_ANIM;
-    for (i = 0; i < an_n; i++) an_cur[i] = an_list[i * 4 + 3] & 3;
-    ab_n = 0; an_cursor = 0;
-}
-
-static void anim_scan(void) {
-    unsigned char i, k, ph, step;
-    const unsigned char *q;
-    if (!an_n || ab_n) return;
-    step = frame_ct >> 3;
-    i = an_cursor;
-    for (k = 0; k < an_n && ab_n < 6; k++) {
-        q = an_list + i * 4;
-        ph = (q[3] + step) & 3;
-        if (ph != an_cur[i]) {
-            an_cur[i] = ph;
-            ab_tile[ab_n] = q[0] | ((unsigned int)q[1] << 8);
-            ab_src[ab_n] = anim_art + (unsigned int)q[2] * 128 + ph * 32;
-            ab_n++;
-        }
-        if (++i >= an_n) i = 0;
+    for (i = 0; i < an_n; i++, q += 4, a++) {
+        a->tile = q[0] | ((unsigned int)q[1] << 8);
+        a->art  = anim_art + ((unsigned int)q[2] << 7);
+        a->m = a->cur = q[3] & 3;
     }
-    an_cursor = i;
+    ab_n = 0; an_cursor = 0; an_done_step = 0xFF;
 }
 
-static void anim_upload(void) {
-    unsigned char k;
+/* queue up to 6 live subtiles whose phase is stale for the current step
+   (round robin from an_cursor; a full lap that finds < 6 marks the step
+   done). Hand-written: SDCC's version cost ~1.2k cycles an entry.
+   AnimTile layout: tile +0, art +2, m +4, cur +5. */
+unsigned char as_step, as_i, as_ph;
+unsigned int *as_pt;
+const unsigned char **as_ps;
+void anim_scan(void) __naked {
+__asm
+    ld   a, (_an_n)
+    or   a, a
+    ret  Z
+    ld   a, (_ab_n)
+    or   a, a
+    ret  NZ
+    ld   a, (_frame_ct)
+    rrca
+    rrca
+    rrca
+    and  a, #0x1F
+    ld   c, a
+    ld   a, (_an_done_step)
+    cp   a, c
+    ret  Z                      ; everything current for this step
+    ld   a, c
+    ld   (_as_step), a
+    ld   hl, #_ab_tile
+    ld   (_as_pt), hl
+    ld   hl, #_ab_src
+    ld   (_as_ps), hl
+    ld   a, (_an_cursor)
+    ld   (_as_i), a
+    ld   l, a
+    ld   h, #0
+    add  hl, hl
+    ld   e, l
+    ld   d, h
+    add  hl, hl
+    add  hl, de                 ; cursor * 6
+    ld   de, #_an
+    add  hl, de
+    ld   a, (_an_n)
+    ld   b, a                   ; entries left in the lap
+    ld   c, #0                  ; queued
+00400$:
+    push hl
+    ld   de, #4
+    add  hl, de
+    ld   a, (_as_step)
+    add  a, (hl)                ; + m
+    and  a, #3                  ; phase
+    inc  hl
+    cp   a, (hl)                ; == cur ?
+    jr   Z, 00410$
+    ld   (hl), a                ; cur = phase
+    ld   (_as_ph), a
+    pop  hl
+    push hl
+    ld   e, (hl)
+    inc  hl
+    ld   d, (hl)                ; de = tile
+    inc  hl
+    push hl
+    ld   hl, (_as_pt)
+    ld   (hl), e
+    inc  hl
+    ld   (hl), d
+    inc  hl
+    ld   (_as_pt), hl
+    pop  hl
+    ld   e, (hl)
+    inc  hl
+    ld   d, (hl)                ; de = art (frame 0)
+    ld   a, (_as_ph)
+    rrca
+    rrca
+    rrca                        ; phase * 32
+    add  a, e
+    ld   e, a
+    adc  a, d
+    sub  a, e
+    ld   d, a
+    ld   hl, (_as_ps)
+    ld   (hl), e
+    inc  hl
+    ld   (hl), d
+    inc  hl
+    ld   (_as_ps), hl
+    inc  c
+00410$:
+    pop  hl
+    ld   de, #6
+    add  hl, de
+    ld   a, (_as_i)
+    inc  a
+    ld   e, a
+    ld   a, (_an_n)
+    cp   a, e
+    jr   NZ, 00420$
+    ld   e, #0
+    ld   hl, #_an
+00420$:
+    ld   a, e
+    ld   (_as_i), a
+    ld   a, c
+    cp   a, #6
+    jr   Z, 00430$              ; batch full
+    djnz 00400$
+    ld   a, (_as_step)          ; full lap with room to spare: step done
+    ld   (_an_done_step), a
+00430$:
+    ld   a, (_as_i)
+    ld   (_an_cursor), a
+    ld   a, c
+    ld   (_ab_n), a
+    ret
+__endasm;
+}
+
+/* send the queued live subtiles: per tile, set the VRAM write address
+   (tile * 32) and burst its 32 bytes. Runs in VBlank, so raw OUTIs. */
+void anim_blit(void) __naked {
+__asm
+    ld   a, (_ab_n)
+    or   a, a
+    ret  Z
+    ld   b, a
+    ld   de, #_ab_tile
+    ld   hl, #_ab_src
+00500$:
+    push bc
+    push hl
+    ld   a, (de)
+    ld   l, a
+    inc  de
+    ld   a, (de)
+    ld   h, a
+    inc  de
+    add  hl, hl
+    add  hl, hl
+    add  hl, hl
+    add  hl, hl
+    add  hl, hl                 ; tile * 32
+    ld   a, l
+    di                          ; an IRQ reading the status port between
+    out  (0xBF), a              ; the two control writes would reset the
+    ld   a, h                   ; VDP address latch
+    or   a, #0x40               ; VRAM write
+    out  (0xBF), a
+    ei
+    pop  hl
+    ld   a, (hl)
+    inc  hl
+    push hl
+    ld   h, (hl)
+    ld   l, a                   ; hl = source frame
+    ld   c, #0xBE
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    outi
+    pop  hl
+    inc  hl
+    pop  bc
+    djnz 00500$
+    ret
+__endasm;
+}
+
+void anim_upload(void) {
     map2(BANK_SPR2);
-    for (k = 0; k < ab_n; k++) UNSAFE_SMS_loadNTiles(ab_src[k], ab_tile[k], 1);
+    anim_blit();
     ab_n = 0;
 }
 
-static void load_level(unsigned char lvl) {
+void load_level(unsigned char lvl) {
     unsigned char i;
     const unsigned char *p;
 
@@ -616,7 +1070,7 @@ static void load_level(unsigned char lvl) {
     mapW = ld->W; mapH = ld->H;
     mapPW = mapW << 4; mapPH = mapH << 4;
     {
-        unsigned int o = 0, r;
+        const unsigned char *o = ld->map; unsigned int r;
         for (r = 0; r < mapH; r++) { row_off[r] = o; o += mapW; }
     }
 
@@ -631,7 +1085,7 @@ static void load_level(unsigned char lvl) {
     if (lvl) {
         SMS_loadTiles(spr_blt, VT_BULLET, 12 * 32);
         SMS_loadTiles(spr_eray, VT_ERAY, 2 * 32);
-        SMS_loadTiles(spr_chunk, VT_CHUNK, 4 * 32);
+        SMS_loadTiles(spr_chunk, VT_CHUNK, 9 * 32);
     }
     if (lvl == LVL_FLY) {
         map2(BANK_SPR2);
@@ -649,8 +1103,8 @@ static void load_level(unsigned char lvl) {
     { unsigned char zi;
       for (zi = 0; zi <= MAX_OVR_ROWS; zi++) ovr_row0[zi] = 0; }
     n_items = ld->nitems;
-    it_lo = 0;
-    n_near = 0; near_timer = 0; near_pg = 0xFF;
+    it_lo = 0; it_c0 = 0xFF;
+    n_near = 0; n_vis = 0; near_timer = 7;
     p = ld->items;
     for (i = 0; i < n_items; i++) {
         it_mx[i] = *p++; it_my[i] = *p++; it_kind[i] = *p++; it_restore[i] = *p++;
@@ -668,21 +1122,55 @@ static void load_level(unsigned char lvl) {
     y_n = ld->nents;
     if (y_n > MAX_ENT) y_n = MAX_ENT;
     p = ld->ents;
-    for (i = 0; i < y_n; i++) {
+    {
+    Ent *e = ents;
+    rope_rows = 0; rope_ent = 0; shake_t = 0; flash_t = 0;
+    for (i = 0; i < y_n; i++, e++) {
         unsigned char t = *p++, emx = *p++, emy = *p++;
-        e_type[i] = t;
-        y_px[i] = (int)emx << 4;
-        y_pg[i] = emx >> 4;                       /* (emx<<4)>>8 */
-        y_py[i] = ((int)emy << 4) - (t <= ET_TANK ? 8 : 0);  /* 24px tall */
-        y_vx[i] = y_vy[i] = y_sx[i] = y_sy[i] = 0;
-        y_state[i] = 0; y_t[i] = (i * 37) & 63; y_hop[i] = (i * 13) & 31;
-        y_hp[i] = (t == ET_VORT) ? 4 : 1;
-        y_frame[i] = 0xFD; y_slot[i] = 0xFF;
-        if (t == ET_YORP || t == ET_GARG) y_vx[i] = (i & 1) ? 128 : -128;
-        if (t == ET_BUTLER || t == ET_TANK) y_vx[i] = (i & 1) ? 96 : -96;
+        memset(e, 0, sizeof(Ent));
+        e->type = t;
+        e->px = (int)emx << 4;
+        /* CG puts the sprite's top-left on the marker tile; the butler's
+           16x16 art sits in the bottom of its 16x24 box */
+        e->py = ((int)emy << 4) - (t == ET_BUTLER ? 8 : 0);
+        e->hp = 1;
+        e->slot = 0xFF;
+        e->fl = FL_AIR;
+        e->dir = LEFT_;
+        switch (t) {
+        case ET_YORP:                         /* CYorp ctor */
+            e->state = Y_LOOK; e->lk = 13; e->frame = YF_STAND; break;
+        case ET_GARG:                         /* CGarg ctor */
+            e->state = G_LOOK; e->lk = 4; e->dir = CENTER_; break;
+        case ET_VORT:                         /* CVorticon ctor */
+            e->state = V_LOOK; e->t = 161; e->dir = RIGHT_;
+            e->frame = VF_LOOK;
+            e->hp = (lvl == 16) ? 105 : 4;    /* HPs from KEEN1.EXE */
+            break;
+        case ET_BUTLER:                       /* CButler ctor */
+            e->state = B_FALL; e->dir = CENTER_; e->frame = BF_WALK_LEFT; break;
+        case ET_TANK:                         /* CTank ctor */
+            e->state = T_WALK; e->dir = RIGHT_; e->jt = CENTER_; e->t = 200;
+            e->frame = TF_WALK_RIGHT; break;
+        case ET_ROPE:
+            rope_ent = e; e->fl = 0; break;
+        default: break;                       /* ice cannons */
+        }
     }
-    for (i = 0; i < N_SLOTS; i++) { slot_owner[i] = 0xFF; slot_vframe[i] = 0xFE; slot_part[i] = 0; }
-    for (i = 0; i < 4; i++) pj_on[i] = 0;
+    }
+    if (rope_ent) {                           /* RAM copy of the rows the stone crosses */
+        unsigned char r;
+        unsigned int ry0 = (rope_ent->py >> 4) + 1;
+        rope_rows = STONE_H + 4;
+        for (r = 0; r < rope_rows; r++) {
+            memcpy(rope_map[r], row_off[ry0 + r], mapW);
+            row_off[ry0 + r] = rope_map[r];
+        }
+        rope_bg = rope_map[2][(rope_ent->px >> 4) - 4];
+    }
+    for (i = 0; i < N_SLOTS; i++) { slot_owner[i] = 0; slot_vframe[i] = 0xFE; slot_part[i] = 0; }
+    for (i = 0; i < N_PROJ; i++) pj_on[i] = 0;
+    for (i = 0; i < N_BITS; i++) bit_t[i] = 0;
     inv_keys = 0; stun_t = 0; n_open_doors = 0;
     n_entries = ld->nentries;
     p = ld->entries;
@@ -706,7 +1194,7 @@ static void load_level(unsigned char lvl) {
     vx = vy = sx_acc = sy_acc = 0;
     on_ground = jumping = pogoing = pogo_squat = 0;
     jprep = 0; pogo_hold = 0; parts_at_entry = inv_parts; hint_used = 0;
-    shoot_timer = 0; exiting = 0; dying = 0; seq_timer = 0;
+    shoot_timer = 0; exiting = 0; dying = 0; seq_timer = 0; exit_cut = 0;
     dir_right = 1; pframe = KF_STAND_R; cur_pframe = 0xFF; anim_t = 0;
     b_active = 0; fall_snd_on = 0;
 
@@ -728,15 +1216,6 @@ void wait_frames(unsigned int n) {
     while (n--) { SMS_waitForVBlank(); sfx_update(); }
 }
 
-static void screen_text_begin(void) {
-    SMS_displayOff();
-    SMS_VDPturnOffFeature(VDPFEATURE_LEFTCOLBLANK);
-    SMS_initSprites();
-    SMS_copySpritestoSAT();
-    SMS_VRAMmemsetW(0, 0x0000, 16384);
-    SMS_setBGScrollX(0); SMS_setBGScrollY(0);
-    font_load();
-}
 
 /* -------------------------------------------------------------- dialogs --- */
 /* Boxes are drawn straight into the scrolling name table. While one is up
@@ -745,8 +1224,8 @@ static void screen_text_begin(void) {
    the covered cells from the map. Dialog tiles live in the sprite half of
    VRAM (256+), which is reloaded afterwards. */
 char dlg_buf[168];
-static unsigned char dlg_x0, dlg_y0, dlg_w, dlg_h;     /* box incl. frame, in cells */
-static unsigned int  t_f0, t_f1, t_fr, t_ic, t_kn;     /* VRAM tile bases */
+unsigned char dlg_x0, dlg_y0, dlg_w, dlg_h;     /* box incl. frame, in cells */
+unsigned int  t_f0, t_f1, t_fr, t_ic, t_kn;     /* VRAM tile bases */
 
 void txt_get(unsigned char id) {
     unsigned char ob = b2_shadow, i = 0;
@@ -758,12 +1237,12 @@ void txt_get(unsigned char id) {
     SMS_mapROMBank(ob);
 }
 
-static void dlg_put(unsigned char cx, unsigned char cy, unsigned int tile) {
+void dlg_put(unsigned char cx, unsigned char cy, unsigned int tile) {
     SMS_setTileatXY((unsigned char)((cam_c8 + dlg_x0 + cx) & 31),
                     (unsigned char)((cam_r8 + dlg_y0 + cy) % 28), tile);
 }
 
-static void dlg_str(unsigned char cx, unsigned char cy, const char *s, unsigned int base) {
+void dlg_str(unsigned char cx, unsigned char cy, const char *s, unsigned int base) {
     unsigned char x = cx;
     for (; *s; s++) {
         if (*s == '\n') { x = cx; cy++; continue; }
@@ -773,7 +1252,7 @@ static void dlg_str(unsigned char cx, unsigned char cy, const char *s, unsigned 
 }
 
 /* box of (w x h) interior cells, centred; fill = tile for the interior */
-static void dlg_box(unsigned char w, unsigned char h, unsigned int fill) {
+void dlg_box(unsigned char w, unsigned char h, unsigned int fill) {
     unsigned char x, y;
     dlg_w = w + 2; dlg_h = h + 2;
     dlg_x0 = 1 + (31 - dlg_w) / 2;
@@ -793,7 +1272,7 @@ static void dlg_box(unsigned char w, unsigned char h, unsigned int fill) {
         }
 }
 
-static void dlg_wait(void) {
+void dlg_wait(void) {
     unsigned int ks;
     for (;;) { SMS_waitForVBlank(); sfx_update(); if (!(SMS_getKeysStatus() & (PORT_A_KEY_1 | PORT_A_KEY_2))) break; }
     for (;;) {
@@ -805,7 +1284,7 @@ static void dlg_wait(void) {
     prev_ks = SMS_getKeysStatus();
 }
 
-static void dlg_close(void) {
+void dlg_close(void) {
     unsigned char x, y;
     for (y = 0; y < dlg_h; y++) {
         unsigned int wr = cam_r8 + dlg_y0 + y;
@@ -828,14 +1307,14 @@ static void dlg_close(void) {
             map2(BANK_SPRITES);
             SMS_loadTiles(spr_blt, VT_BULLET, 12 * 32);
             SMS_loadTiles(spr_eray, VT_ERAY, 2 * 32);
-            SMS_loadTiles(spr_chunk, VT_CHUNK, 4 * 32);
+            SMS_loadTiles(spr_chunk, VT_CHUNK, 9 * 32);
             map2(ld->map_bank);
         }
     }
 }
 
 /* load the plain message-box tile set: font 0 (black on white) + frame */
-static void dlg_tiles_msg(void) {
+void dlg_tiles_msg(void) {
     unsigned char ob = b2_shadow;
     t_f0 = 256; t_fr = 256 + 96;
     SMS_mapROMBank(BANK_TXT);
@@ -845,7 +1324,7 @@ static void dlg_tiles_msg(void) {
 }
 
 /* "You hear in your mind..." style box from string id */
-static void show_text_box(unsigned char id) {
+void show_text_box(unsigned char id) {
     unsigned char w = 0, h = 1, cur = 0;
     const char *s;
     txt_get(id);
@@ -858,21 +1337,21 @@ static void show_text_box(unsigned char id) {
     dlg_str(2, 2, dlg_buf, t_f0);
 }
 
-static void show_hint(unsigned char lvl_msg) {
+void show_hint(unsigned char lvl_msg) {
     show_text_box(lvl_msg);
     dlg_wait();
     dlg_close();
 }
 
 /* 16x16 icon (4 tiles) at interior cell (cx,cy); pal = NT palette bit */
-static void dlg_icon(unsigned char cx, unsigned char cy, unsigned int base, unsigned int pal) {
+void dlg_icon(unsigned char cx, unsigned char cy, unsigned int base, unsigned int pal) {
     dlg_put(cx,     cy,     base     | pal);
     dlg_put(cx + 1, cy,     base + 1 | pal);
     dlg_put(cx,     cy + 1, base + 2 | pal);
     dlg_put(cx + 1, cy + 1, base + 3 | pal);
 }
 
-static void show_ship_box(void) {
+void show_ship_box(void) {
     unsigned char i, ob = b2_shadow;
     show_text_box(TXT_SHIP);
     t_ic = t_fr + 8;
@@ -886,7 +1365,7 @@ static void show_ship_box(void) {
     dlg_close();
 }
 
-static void show_keens_left(void) {
+void show_keens_left(void) {
     unsigned char i, ob = b2_shadow;
     dlg_tiles_msg();
     t_kn = t_fr + 8;
@@ -909,7 +1388,7 @@ static void show_keens_left(void) {
     prev_ks = SMS_getKeysStatus();
 }
 
-static void dlg_num(unsigned char cx, unsigned char cy, unsigned long v, unsigned char right_edge) {
+void dlg_num(unsigned char cx, unsigned char cy, unsigned long v, unsigned char right_edge) {
     char nb[8]; unsigned char n = 0, i;
     do { nb[n++] = '0' + (unsigned char)(v % 10); v /= 10; } while (v && n < 7);
     for (i = 0; i < n; i++)
@@ -917,13 +1396,13 @@ static void dlg_num(unsigned char cx, unsigned char cy, unsigned long v, unsigne
     (void)cx;
 }
 
-static void dlg_field(unsigned char x, unsigned char y, unsigned char w, unsigned char h) {
+void dlg_field(unsigned char x, unsigned char y, unsigned char w, unsigned char h) {
     unsigned char i, j;
     for (j = 0; j < h; j++) for (i = 0; i < w; i++) dlg_put(x + i, y + j, t_f0);
 }
 
 /* the original status box (CStatusScreen): 30x15 cells */
-static void show_status_box(void) {
+void show_status_box(void) {
     unsigned char i, ob = b2_shadow;
     unsigned long sc = (unsigned long)score_hi * 10000UL + score_lo;
     SMS_waitForVBlank();
@@ -962,11 +1441,11 @@ static void show_status_box(void) {
 /* ---------------------------------------------------------------- player --- */
 /* hitbox: x px+3..px+12 (w10), y py+1..py+23 (h23), sprite 16x24 */
 
-static unsigned char probe3_x(int wx, int y0) {
+unsigned char probe3_x(int wx, int y0) {
     return (mflag(wx, y0 + 2) | mflag(wx, y0 + 12) | mflag(wx, y0 + 22));
 }
 
-static void player_move_x(void) {
+void player_move_x(void) {
     int dx;
     sx_acc += vx;
     dx = sx_acc >> 8;
@@ -988,7 +1467,7 @@ static void player_move_x(void) {
     if (px > (int)mapPW - 13) px = (int)mapPW - 13;
 }
 
-static void player_move_y(void) {
+void player_move_y(void) {
     int dy;
     sy_acc += vy;
     dy = sy_acc >> 8;
@@ -1027,8 +1506,8 @@ static void player_move_y(void) {
 /* player life cycle (CG: pdie / dieanim). lives are shown on the status
    screen; losing the last one ends the game. */
 
-static void player_die(void) {
-    if (dying) return;
+void player_die(void) {
+    if (dying || perf_on == 2) return;      /* 2 = benchmark god mode */
     dying = 1; seq_timer = 0;
     sfx_play(SND_DIE);
     vx = vy = 0; pogoing = 0; jprep = 0; jumping = 0;
@@ -1036,7 +1515,7 @@ static void player_die(void) {
     inv_parts = parts_at_entry;               /* a part found in this level is lost */
 }
 
-static void spawn_bullet(void) {
+void spawn_bullet(void) {
     if (!inv_ammo) { sfx_play(SND_GUNCLICK); return; }
     if (b_active) return;
     inv_ammo--;
@@ -1047,15 +1526,15 @@ static void spawn_bullet(void) {
     sfx_play(SND_FIRE);
 }
 
-static unsigned char flags_under(void) {      /* tiles just below the feet */
+unsigned char flags_under(void) {      /* tiles just below the feet */
     return mflag(px + 4, py + 24) | mflag(px + 11, py + 24);
 }
 
-static void player_launch(int v) {
+void player_launch(int v) {
     vy = v; on_ground = 0; jumping = 1; jprep = 0; sy_acc = 0;
 }
 
-static void player_update(unsigned int ks, unsigned int kp) {
+void player_update(unsigned int ks, unsigned int kp) {
     unsigned char i, ice = 0, semi = 0;
 
     if (dying) {                               /* CG dieanim: 80 ticks, then fly off */
@@ -1092,7 +1571,8 @@ static void player_update(unsigned int ks, unsigned int kp) {
     if (stun_t) {
         stun_t--;
         ks = 0; kp = 0;
-        if (on_ground && !(flags_under() & F_ICE)) vx = 0;
+        if (vx > 0)      { vx -= EV(10); if (vx < 0) vx = 0; }   /* CG friction */
+        else if (vx < 0) { vx += EV(10); if (vx > 0) vx = 0; }
         pframe = (stun_t < 20) ? 31 : (28 + ((stun_t / 26) & 1));
     }
 
@@ -1149,7 +1629,9 @@ static void player_update(unsigned int ks, unsigned int kp) {
         pframe = (dir_right ? 8 : 14) + jframe;
     } else {
         /* walking / sliding */
-        if (ice) {
+        if (stun_t) {
+            /* frozen: no steering, the shove from the chunk just coasts */
+        } else if (ice) {
             if (ks & PORT_A_KEY_LEFT)       dir_right = 0;
             else if (ks & PORT_A_KEY_RIGHT) dir_right = 1;
             vx = dir_right ? WALK_MAX : -WALK_MAX;
@@ -1209,8 +1691,8 @@ static void player_update(unsigned int ks, unsigned int kp) {
     if (py >= -4 && (unsigned int)(py + 20) < mapPH) {
         unsigned char cx0 = (unsigned char)((unsigned int)(px + 3) >> 4);
         unsigned char cx1 = (unsigned char)((unsigned int)(px + 12) >> 4);
-        const unsigned char *r0 = map_rom + row_off[(unsigned int)(py + 4) >> 4];
-        const unsigned char *r1 = map_rom + row_off[(unsigned int)(py + 20) >> 4];
+        const unsigned char *r0 = row_off[(unsigned int)(py + 4) >> 4];
+        const unsigned char *r1 = row_off[(unsigned int)(py + 20) >> 4];
         if ((flags_ram[r0[cx0]] | flags_ram[r0[cx1]] |
              flags_ram[r1[cx0]] | flags_ram[r1[cx1]]) & F_DEADLY) {
             player_die(); return;
@@ -1219,24 +1701,30 @@ static void player_update(unsigned int ks, unsigned int kp) {
     /* fell out of the world (CG: PLUMMET finishes, then Keen dies) */
     if (py > (int)mapPH + 16) { player_die(); seq_timer = 120; return; }
 
-    /* items: the table is sorted by column; keep a cached start index and
-       scan only items with mx in [pcx-1, pcx+1]. The cache follows the
-       player incrementally, so per-frame cost is a handful of items
-       instead of the whole table (up to ~170 on big levels). */
+    /* items: Keen's box (x+3..x+12, y+1..y+23) touches exactly the item
+       cells in columns c0..c1, rows r0..r1, so the table (sorted by
+       column, then row) is only scanned when that cell rectangle changes
+       -- or while stunned, when a hint statue may become collectable.
+       A cached start index follows the player along the sorted table. */
     {
-    unsigned char pcx = (unsigned char)((unsigned int)(px + 8) >> 4);
-    unsigned char pcy = (unsigned char)((unsigned int)(py + 12) >> 4);
+    unsigned char c0 = (unsigned char)((unsigned int)(px + 3) >> 4);
+    unsigned char c1 = (unsigned char)((unsigned int)(px + 12) >> 4);
+    unsigned char r0 = (unsigned char)((unsigned int)(py + 1) >> 4);
+    unsigned char r1 = (unsigned char)((unsigned int)(py + 23) >> 4);
+    if (c0 != it_c0 || c1 != it_c1 || r0 != it_r0 || r1 != it_r1 || stun_t) {
     unsigned char lo = it_lo;
-    while (lo && (unsigned char)(it_mx[lo - 1] + 1) >= pcx) lo--;
-    while (lo < n_items && (unsigned char)(it_mx[lo] + 1) < pcx) lo++;
+    const unsigned char *pmx, *pmy;
+    it_c0 = c0; it_c1 = c1; it_r0 = r0; it_r1 = r1;
+    while (lo && it_mx[lo - 1] >= c0) lo--;
+    while (lo < n_items && it_mx[lo] < c0) lo++;
     it_lo = lo;
-    for (i = lo; i < n_items && it_mx[i] <= (unsigned char)(pcx + 1); i++) {
-        int cx, cy;
+    pmx = it_mx + lo; pmy = it_my + lo;
+    r1 -= r0;
+    for (i = lo; i < n_items; i++, pmx++, pmy++) {
+        if (*pmx > c1) break;
+        if ((unsigned char)(*pmy - r0) > r1) continue;
         if (it_taken[i]) continue;
-        if ((unsigned char)(it_my[i] - pcy + 1) > 2) continue;
-        cx = (int)it_mx[i] << 4; cy = (int)it_my[i] << 4;
-        if (px + 12 >= cx && px + 3 <= cx + 15 &&
-            py + 23 >= cy && py + 1 <= cy + 15) {
+        {
             unsigned char k = it_kind[i];
             if (k == K_HINT && (hint_used || stun_t)) continue;
             it_taken[i] = 1;
@@ -1264,6 +1752,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
         }
     }
     }
+    }
 
     /* exit door cells (tile 159): touch while grounded */
     if (on_ground && !pogoing && !jprep) {
@@ -1272,6 +1761,7 @@ static void player_update(unsigned int ks, unsigned int kp) {
         for (i = 0; i < n_exits; i++)
             if (ex_mx[i] == ecx && (ex_my[i] == ecy || ex_my[i] == ecy + 1)) {
                 exiting = 1; seq_timer = 0;
+                exit_cut = ((unsigned int)(ex_mx[i] + 2) << 4) - 1;   /* CG exitXpos */
                 sfx_play(SND_LVLDONE);
                 break;
             }
@@ -1322,302 +1812,6 @@ static void player_update(unsigned int ks, unsigned int kp) {
     }
 }
 
-/* ---------------------------------------------------------------- bullet --- */
-static void bullet_update(void) {
-    unsigned char i;
-    if (!b_active) return;
-    if (b_hit) {
-        if (++b_timer > 8) b_active = 0;
-        return;
-    }
-    b_px += b_right ? (BULLET_V >> 8) : -(BULLET_V >> 8);
-    /* out of view */
-    if (b_px < (int)cam_x - 24 || b_px > (int)cam_x + 272) { b_active = 0; return; }
-    /* wall */
-    if (mflag(b_px + 8, b_py + 4) & (b_right ? F_BLKR : F_BLKL)) {
-        b_hit = 1; b_timer = 0;
-        rng = rng * 13 + 7;
-        sfx_play(SND_SHOTHIT);
-        return;
-    }
-    /* entities */
-    for (i = 0; i < y_n; i++) {
-        if (y_state[i] >= 2 || e_type[i] >= ET_CANNON0) continue;
-        if (b_px + 12 >= y_px[i] && b_px + 4 <= y_px[i] + 15 &&
-            b_py + 6  >= y_py[i] && b_py + 2 <= y_py[i] + 23) {
-            b_hit = 1; b_timer = 0;
-            sfx_play(SND_SHOTHIT);
-            if (e_type[i] == ET_TANK || e_type[i] == ET_BUTLER)
-                return;                          /* armored: zap absorbed */
-            if (y_hp[i] > 1) { y_hp[i]--; return; }
-            y_state[i] = 2; y_t[i] = 0;
-            sfx_play((e_type[i] == ET_YORP) ? SND_YORPSCREAM :
-                     (e_type[i] == ET_GARG) ? SND_GARGSCREAM :
-                                              SND_VORTSCREAM);
-            return;
-        }
-    }
-}
-
-/* ----------------------------------------------------------------- yorps --- */
-/* move entity i with gravity + tile collision (16x24 body, 12px wide box) */
-static void ent_move(unsigned char i, unsigned char gravity) {
-    int d;
-    unsigned char f;
-    if (gravity) {
-        y_vy[i] += 20;
-        if (y_vy[i] > 768) y_vy[i] = 768;
-    }
-    y_sx[i] += y_vx[i];
-    d = y_sx[i] >> 8; y_sx[i] -= d << 8;
-    if (d > 0) {
-        f = mflag(y_px[i] + 13 + d, y_py[i] + 8) | mflag(y_px[i] + 13 + d, y_py[i] + 20);
-        if (f & F_BLKR) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
-    } else if (d < 0) {
-        f = mflag(y_px[i] + 2 + d, y_py[i] + 8) | mflag(y_px[i] + 2 + d, y_py[i] + 20);
-        if (f & F_BLKL) { y_vx[i] = -y_vx[i]; } else y_px[i] += d;
-    }
-    y_pg[i] = (unsigned char)(((unsigned int)y_px[i]) >> 8);
-    y_sy[i] += y_vy[i];
-    d = y_sy[i] >> 8; y_sy[i] -= d << 8;
-    if (d > 0) {
-        int ny = y_py[i] + 23 + d;
-        unsigned char crossed = ((y_py[i] + 23) >> 4) < (ny >> 4);
-        f = mflag(y_px[i] + 4, ny) | mflag(y_px[i] + 11, ny);
-        if ((f & F_UP) && ((f & F_CEIL) || crossed)) {
-            y_py[i] = (ny & ~15) - 24; y_vy[i] = 0; y_sy[i] = 0;
-        } else y_py[i] += d;
-    } else if (d < 0) {
-        int ny = y_py[i] + 1 + d;
-        f = mflag(y_px[i] + 4, ny) | mflag(y_px[i] + 11, ny);
-        if (f & F_CEIL) { y_vy[i] = 0; y_sy[i] = 0; }
-        else y_py[i] += d;
-    }
-}
-
-static unsigned char ent_grounded(unsigned char i) {
-    return ((mflag(y_px[i] + 4, y_py[i] + 24) |
-             mflag(y_px[i] + 11, y_py[i] + 24)) & F_UP) ? 1 : 0;
-}
-
-/* is a walk in direction dir (0=left 1=right) about to step off a ledge? */
-static unsigned char ent_at_edge(unsigned char i, unsigned char right) {
-    int ex = right ? (y_px[i] + 15) : y_px[i];
-    return !(mflag(ex, y_py[i] + 26) & F_UP);
-}
-
-static unsigned char player_overlap(unsigned char i) {
-    return (px + 12 >= y_px[i] && px + 3 <= y_px[i] + 15 &&
-            py + 22 >= y_py[i] + 2 && py + 2 <= y_py[i] + 22);
-}
-
-static void spawn_proj(unsigned char kind, int x, int y, int vx8, int vy8) {
-    unsigned char i;
-    for (i = 0; i < 4; i++)
-        if (!pj_on[i]) {
-            pj_on[i] = kind;
-            pj_x[i] = x; pj_y[i] = y; pj_vx[i] = vx8; pj_vy[i] = vy8;
-            return;
-        }
-}
-
-/* Rebuild the near-entity list: everything within x-pages cam_pg-1..
-   cam_pg+2 (>=256px of slack around the AI wake window). Rebuilt every 8
-   frames or when the camera page changes; entities and camera drift well
-   under a page in that time, so nothing can slip in or out unseen. This
-   lets the per-frame entity loops touch ~6 indices instead of MAX_ENT --
-   SDCC's per-access array indexing makes even "filtered" iterations
-   expensive, so shrinking N is worth more than any per-iteration trim. */
-static void rebuild_near(void) {
-    unsigned char i, n = 0;
-    for (i = 0; i < y_n; i++) {
-        if ((unsigned char)(y_pg[i] - cam_pg + 1) <= 3) {
-            near_list[n++] = i;
-        } else {
-            /* far away: release any sprite slot it still holds and give
-               stunned ones their recovery ticks for the skipped frames */
-            if (y_slot[i] != 0xFF) { slot_owner[y_slot[i]] = 0xFF; y_slot[i] = 0xFF; }
-            if (y_state[i] == 1) {
-                y_t[i] += 8;
-                if (y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
-            }
-        }
-    }
-    n_near = n;
-}
-
-static void ent_update(unsigned char i) {
-    int dx;
-    unsigned char t = e_type[i];
-
-    if (y_state[i] == 3) return;                 /* dead */
-    dx = y_px[i] - (int)cam_x;
-    if (dx < -80 || dx > 320) {                  /* offscreen cull */
-        if (y_state[i] == 1 && ++y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
-        return;
-    }
-    if ((dx < -16 || dx > 256) && ((frame_ct ^ i) & 1)) {
-        /* in the wake window but not on screen: think at half rate.
-           On-screen behavior is untouched; offscreen walkers just cover
-           ground a little slower, close to the original's sleep-until-
-           seen behavior. */
-        return;
-    }
-
-    if (t >= ET_CANNON0) {                       /* ice cannons: fire chunks */
-        static const signed char cvx[4] = { 1, 0, 0, -1 };
-        static const signed char cvy[4] = { -1, -1, 1, -1 };
-        if (++y_t[i] > 110) {
-            unsigned char v = t - ET_CANNON0;
-            y_t[i] = 0;
-            sfx_play(SND_CANNON);
-            spawn_proj(1, y_px[i], y_py[i] + 8,
-                       (int)cvx[v] * 384, (int)cvy[v] * 384);
-        }
-        return;
-    }
-
-    if (y_state[i] == 2) {                       /* dying */
-        y_frame[i] = (t == ET_YORP) ? 10 : ((t == ET_GARG) ? 5 : 6);
-        if (++y_t[i] > 12) {
-            y_state[i] = 3;                      /* corpse stays visible */
-            y_frame[i] = (t == ET_YORP) ? 11 : ((t == ET_GARG) ? 6 : 7);
-        }
-        return;
-    }
-    if (y_state[i] == 1) {                       /* stunned (yorp only) */
-        y_frame[i] = 8 + ((y_t[i] >> 3) & 1);
-        if (++y_t[i] > 240) { y_state[i] = 0; y_t[i] = 0; }
-        return;
-    }
-
-    switch (t) {
-    case ET_YORP:
-        if (++y_hop[i] > 40) {
-            if (ent_grounded(i)) y_vy[i] = -320;
-            y_hop[i] = 0;
-        }
-        dx = px - y_px[i];
-        if (dx < -20 || dx > 20) {
-            if (dx < 0) { y_vx[i] -= 13; if (y_vx[i] < -64) y_vx[i] = -64; }
-            else        { y_vx[i] += 13; if (y_vx[i] >  64) y_vx[i] =  64; }
-        } else y_vx[i] = 0;
-        ent_move(i, 1);
-        /* head-bump stuns; side contact shoves keen away */
-        if (!dying && player_overlap(i)) {
-            if (vy > 0 && py + 24 <= y_py[i] + 10) {
-                y_state[i] = 1; y_t[i] = 0;
-                vy = -400; pogoing = 0;
-                sfx_play(SND_YORPBOP);
-            } else {
-                vx = (px < y_px[i]) ? -600 : 600;
-                sfx_play(SND_YORPBUMP);
-            }
-        }
-        if (y_vx[i] > 0)      y_frame[i] = 6 + ((y_hop[i] >> 3) & 1);
-        else if (y_vx[i] < 0) y_frame[i] = 4 + ((y_hop[i] >> 3) & 1);
-        else                  y_frame[i] = 1 + ((y_hop[i] >> 4) & 1);
-        break;
-
-    case ET_GARG: {
-        /* wander; charge when keen is roughly level and lined up */
-        int dy = py - y_py[i];
-        unsigned char charging = 0;
-        dx = px - y_px[i];
-        if (dy > -24 && dy < 24 && dx > -140 && dx < 140) {
-            charging = 1;
-            y_vx[i] = (dx < 0) ? -224 : 224;
-        } else if (y_vx[i] > 96) y_vx[i] = 96;
-        else if (y_vx[i] < -96) y_vx[i] = -96;
-        else if (!y_vx[i]) y_vx[i] = 96;
-        if (!charging && ent_grounded(i) && ent_at_edge(i, y_vx[i] > 0))
-            y_vx[i] = -y_vx[i];                  /* don't walk off ledges */
-        ent_move(i, 1);
-        if (!dying && player_overlap(i)) player_die();
-        y_frame[i] = (y_vx[i] > 0) ? (1 + (charging ? (y_hop[i] >> 2 & 1)
-                                                    : (y_hop[i] >> 3 & 1)))
-                                   : (3 + (charging ? (y_hop[i] >> 2 & 1)
-                                                    : (y_hop[i] >> 3 & 1)));
-        y_hop[i]++;
-        break;
-    }
-
-    case ET_VORT:
-        /* stalk keen; jump every so often */
-        dx = px - y_px[i];
-        y_vx[i] = (dx < 0) ? -128 : 128;
-        if (++y_hop[i] > 70 && ent_grounded(i)) {
-            y_vy[i] = -700; y_hop[i] = 0;
-        }
-        ent_move(i, 1);
-        if (!dying && player_overlap(i)) player_die();
-        if (!ent_grounded(i)) y_frame[i] = (y_vx[i] > 0) ? 4 : 5;
-        else y_frame[i] = ((y_vx[i] > 0) ? 0 : 2) + ((y_hop[i] >> 3) & 1);
-        break;
-
-    case ET_BUTLER:
-        /* patrols; turns at walls and ledges; shoves keen */
-        if (ent_grounded(i) && ent_at_edge(i, y_vx[i] > 0))
-            y_vx[i] = -y_vx[i];
-        ent_move(i, 1);
-        if (!dying && player_overlap(i)) {
-            vx = (px < y_px[i]) ? -700 : 700;
-            sfx_play(SND_YORPBUMP);
-        }
-        y_hop[i]++;
-        y_frame[i] = ((y_vx[i] > 0) ? 0 : 2) + ((y_hop[i] >> 3) & 1);
-        break;
-
-    case ET_TANK:
-        /* patrols; stops to fire at keen; bulletproof */
-        if (y_t[i] > 100 && y_t[i] < 140) {      /* stopped, aiming */
-            y_vx[i] = 0;
-            if (y_t[i] == 120) {
-                unsigned char right = (px > y_px[i]);
-                spawn_proj(2, y_px[i] + (right ? 14 : -14), y_py[i] + 10,
-                           right ? 512 : -512, 0);
-                sfx_play(SND_TANKFIRE);
-                y_hop[i] = right ? 1 : 0;
-            }
-        } else {
-            if (!y_vx[i]) y_vx[i] = (y_hop[i] & 1) ? 96 : -96;
-            if (ent_grounded(i) && ent_at_edge(i, y_vx[i] > 0))
-                y_vx[i] = -y_vx[i];
-        }
-        if (++y_t[i] > 140) y_t[i] = 0;
-        ent_move(i, 1);
-        if (!dying && player_overlap(i)) {
-            vx = (px < y_px[i]) ? -700 : 700;
-            sfx_play(SND_YORPBUMP);
-        }
-        y_hop[i] = (y_vx[i] > 0) ? 1 : ((y_vx[i] < 0) ? 0 : y_hop[i]);
-        y_frame[i] = ((y_hop[i] & 1) ? 0 : 2) + ((unsigned char)y_px[i] >> 3 & 1);
-        break;
-    }
-}
-
-/* projectiles: 1 = ice chunk (stuns), 2 = enemy ray (kills) */
-static void proj_update(void) {
-    unsigned char i;
-    for (i = 0; i < 4; i++) {
-        int nx, ny;
-        if (!pj_on[i]) continue;
-        nx = pj_x[i] + (pj_vx[i] >> 8);
-        ny = pj_y[i] + (pj_vy[i] >> 8);
-        pj_vx[i] += (pj_vx[i] & 0xFF) ? 0 : 0;   /* integer-ish speeds */
-        pj_x[i] = nx; pj_y[i] = ny;
-        if (nx < (int)cam_x - 32 || nx > (int)cam_x + 288 ||
-            ny < -16 || ny > (int)mapPH + 16) { pj_on[i] = 0; continue; }
-        if (mflag(nx + 8, ny + 4) & (F_BLKR | F_BLKL)) { pj_on[i] = 0; continue; }
-        if (!dying &&
-            nx + 12 >= px + 3 && nx + 4 <= px + 12 &&
-            ny + 8  >= py + 2 && ny     <= py + 22) {
-            if (pj_on[i] == 1) { if (!stun_t) { stun_t = 250; pogoing = 0; jprep = 0; } sfx_play(SND_KEENCICLE); }
-            else player_die();
-            pj_on[i] = 0;
-        }
-    }
-}
 
 /* ------------------------------------------------------------ sprite draw -- */
 /* SMSlib's sprite buffers (global in the lib, just not in the header).
@@ -1629,47 +1823,115 @@ extern unsigned char SpriteTableY[64];
 extern unsigned char SpriteTableXN[128];
 extern unsigned char SpriteNextFree;
 
-static void draw_16x24(int sx, int sy, unsigned char base) {
-    if ((unsigned int)sx <= 240 && (unsigned int)sy <= 168) {
-        /* fully on-screen: write the sprite tables directly */
-        unsigned char x = (unsigned char)sx, y1 = (unsigned char)sy - 1;
-        unsigned char n = SpriteNextFree;
-        unsigned char *ty; unsigned char *xn;
-        if (n > 58) return;
-        ty = SpriteTableY + n;
-        xn = SpriteTableXN + ((unsigned char)(n << 1));
-        ty[0] = y1;      ty[1] = y1;
-        ty[2] = y1 + 8;  ty[3] = y1 + 8;
-        ty[4] = y1 + 16; ty[5] = y1 + 16;
-        xn[0] = x;     xn[1]  = base;
-        xn[2] = x + 8; xn[3]  = base + 1;
-        xn[4] = x;     xn[5]  = base + 2;
-        xn[6] = x + 8; xn[7]  = base + 3;
-        xn[8] = x;     xn[9]  = base + 4;
-        xn[10] = x + 8; xn[11] = base + 5;
-        SpriteNextFree = n + 6;
-        return;
-    }
-    SMS_addSpriteClipping(sx,     sy,      base);
-    SMS_addSpriteClipping(sx + 8, sy,      base + 1);
-    SMS_addSpriteClipping(sx,     sy + 8,  base + 2);
-    SMS_addSpriteClipping(sx + 8, sy + 8,  base + 3);
-    SMS_addSpriteClipping(sx,     sy + 16, base + 4);
-    SMS_addSpriteClipping(sx + 8, sy + 16, base + 5);
+/* Metasprite drawer: a w x h block of 8x8 hardware sprites, tiles
+   row-major from ms_base, top-left at screen (ms_x, ms_y). Each sprite is
+   clipped on its own: columns outside x 0..255 and rows outside y -7..191
+   are dropped. Writes SMSlib's sprite tables directly; hand-written
+   because it runs for every visible actor every frame (SDCC's version of
+   the 16x24 case cost ~2.8k cycles; this is ~150 a sprite). */
+static int ms_x, ms_y;
+static unsigned char ms_base, ms_w, ms_h;
+static void ms_draw(void) __naked {
+__asm
+    push ix
+    push iy
+    ld   a, (_SpriteNextFree)
+    ld   c, a
+    ld   a, #64
+    sub  a, c
+    jp   C, 00390$
+    jp   Z, 00390$              ; sprite table already full
+    ld   h, a                   ; h = free entries (kept across rows)
+    ld   b, #0
+    ld   iy, #_SpriteTableY
+    add  iy, bc                 ; iy -> next Y entry
+    ld   ix, #_SpriteTableXN
+    add  ix, bc
+    add  ix, bc                 ; ix -> next X/tile pair
+    ld   a, (_ms_base)
+    ld   e, a                   ; e = tile, runs across rows
+    ld   a, (_ms_h)
+    ld   (_ms_rows), a
+    ld   bc, (_ms_y)
+    ld   (_ms_yy), bc
+00300$:                         ; --- row loop
+    push hl
+    ld   hl, (_ms_yy)
+    ld   bc, #7
+    add  hl, bc
+    ld   a, h
+    or   a, a
+    jr   NZ, 00309$             ; row above y -7 or below the screen
+    ld   a, l
+    cp   a, #199
+    jr   NC, 00309$
+    sub  a, #8                  ; SAT y = screen y - 1
+    ld   d, a
+    pop  hl
+    ld   bc, (_ms_x)
+    ld   l, b                   ; l = x high byte
+    ld   a, (_ms_w)
+    ld   b, a                   ; b = columns, c = x low byte
+00320$:                         ; --- column loop
+    ld   a, l
+    or   a, a
+    jr   NZ, 00330$             ; x outside 0..255
+    ld   0 (iy), d
+    inc  iy
+    ld   0 (ix), c
+    ld   1 (ix), e
+    inc  ix
+    inc  ix
+    dec  h
+    jr   Z, 00380$              ; table full
+00330$:
+    inc  e
+    ld   a, c
+    add  a, #8
+    ld   c, a
+    jr   NC, 00331$
+    inc  l
+00331$:
+    djnz 00320$
+    jr   00350$
+00309$:                         ; skipped row: its tiles still count
+    pop  hl
+    ld   a, (_ms_w)
+    add  a, e
+    ld   e, a
+00350$:
+    push hl
+    ld   hl, (_ms_yy)
+    ld   bc, #8
+    add  hl, bc
+    ld   (_ms_yy), hl
+    pop  hl
+    ld   a, (_ms_rows)
+    dec  a
+    ld   (_ms_rows), a
+    jp   NZ, 00300$
+00380$:
+    push iy
+    pop  hl
+    ld   a, l
+    sub  a, #<(_SpriteTableY)
+    ld   (_SpriteNextFree), a
+00390$:
+    pop  iy
+    pop  ix
+    ret
+__endasm;
 }
-
-/* 24x32 body (garg, vorticon): 12 hardware sprites, row-major 3x4 */
-static void draw_24x32(int sx, int sy, unsigned char base) {
-    unsigned char r, c;
-    for (r = 0; r < 4; r++)
-        for (c = 0; c < 3; c++)
-            SMS_addSpriteClipping(sx + c * 8, sy + r * 8, base + r * 3 + c);
-}
+static int ms_yy;
+static unsigned char ms_rows;
+#define DRAW_MS(x, y, b, w, h) do { ms_x = (x); ms_y = (y); ms_base = (b); \
+                                    ms_w = (w); ms_h = (h); ms_draw(); } while (0)
+#define draw_16x24(x, y, b) DRAW_MS(x, y, b, 2, 3)
+#define draw_24x32(x, y, b) DRAW_MS(x, y, b, 3, 4)
 
 static unsigned char upload_slot;               /* slot needing stream, or 0xFF */
 static unsigned char upload_part;
-static unsigned char upload_frame;              /* (type<<4)|frame key */
-static unsigned char upload_ent;
+static unsigned char upload_frame;              /* (type<<5)|frame key */
 
 /* per-type sprite sheet base (bank2 array) resolved at upload time */
 static const unsigned char * const ent_art[5] =
@@ -1695,77 +1957,129 @@ static void build_sprites_level(void) {
        Only the near list is walked; rebuild_near releases the slots of
        entities that dropped out of it. */
     upload_slot = 0xFF;
-    for (k = 0; k < n_near; k++) {
-        int sx, sy;
-        unsigned char vis, key;
-        i = near_list[k];
-        if (e_type[i] >= ET_CANNON0) continue;
-        sx = y_px[i] - (int)cam_x;
-        if (sx <= -16 || sx >= 256) {            /* x-invisible: skip sy math */
-            if (y_slot[i] != 0xFF) { slot_owner[y_slot[i]] = 0xFF; y_slot[i] = 0xFF; }
+    {
+    Ent **np = vis_list;
+    for (k = n_vis; k; k--) {
+        Ent *e = *np++;
+        unsigned char key, t, sl;
+        t = e->type;
+        sl = e->slot;
+        ent_rel(e);
+        if ((unsigned int)(er_x + 24) >= 280 || (unsigned int)(er_y + 32) >= 224 ||
+            e->state == ST_GONE) {                /* not visible: free its slot */
+            if (sl != 0xFF) { slot_owner[sl] = 0; e->slot = 0xFF; }
             continue;
         }
-        sy = y_py[i] - (int)cam_y;
-        vis = (sy > -24 && sy < 192);
-        if (!vis) {
-            if (y_slot[i] != 0xFF) { slot_owner[y_slot[i]] = 0xFF; y_slot[i] = 0xFF; }
-            continue;
-        }
-        if (y_slot[i] == 0xFF) {
+        if (sl == 0xFF) {
             for (s = 0; s < N_SLOTS; s++)
-                if (slot_owner[s] == 0xFF) {
-                    slot_owner[s] = i; y_slot[i] = s; slot_vframe[s] = 0xFE;
+                if (!slot_owner[s]) {
+                    slot_owner[s] = e; sl = s; slot_vframe[s] = 0xFE;
                     break;
                 }
-            if (y_slot[i] == 0xFF && y_state[i] < 3) {
+            if (sl == 0xFF && e->state < ST_DEAD) {
                 /* no free slot: a live enemy may steal a corpse's slot */
                 for (s = 0; s < N_SLOTS; s++)
-                    if (slot_owner[s] != 0xFF && y_state[slot_owner[s]] == 3) {
-                        y_slot[slot_owner[s]] = 0xFF;
-                        slot_owner[s] = i; y_slot[i] = s; slot_vframe[s] = 0xFE;
+                    if (slot_owner[s] && slot_owner[s]->state == ST_DEAD) {
+                        slot_owner[s]->slot = 0xFF;
+                        slot_owner[s] = e; sl = s; slot_vframe[s] = 0xFE;
                         break;
                     }
             }
-            if (y_slot[i] == 0xFF) continue;     /* still none: skip */
+            if (sl == 0xFF) continue;            /* still none: skip */
+            e->slot = sl;
         }
-        s = y_slot[i];
-        key = (e_type[i] << 4) | y_frame[i];
-        if (slot_vframe[s] != key && upload_slot == 0xFF) {
-            if (slot_part[s] && slot_pkey[s] != key) slot_part[s] = 0;
-            upload_slot = s; upload_frame = key; upload_ent = i;
-            upload_part = slot_part[s];
+        key = (t << 5) | e->frame;
+        if (slot_vframe[sl] != key) {
+            if (upload_slot == 0xFF) {
+                if (slot_part[sl] && slot_pkey[sl] != key) slot_part[sl] = 0;
+                upload_slot = sl; upload_frame = key;
+                upload_part = slot_part[sl];
+            }
+            if (slot_vframe[sl] == 0xFE) continue;   /* nothing loaded yet */
         }
-        if (slot_vframe[s] != 0xFE) {
-            if (ET_BIG(e_type[i]))               /* 24x32, bottom-anchored */
-                draw_24x32(sx - 4, sy - 8, (unsigned char)(VT_SLOT0 - 256 + s * 12));
-            else
-                draw_16x24(sx, sy, (unsigned char)(VT_SLOT0 - 256 + s * 12));
-        }
+        if (ET_BIG(t))                            /* 24x32 */
+            draw_24x32(er_x, er_y, (unsigned char)(VT_SLOT0 - 256 + sl * 12));
+        else
+            draw_16x24(er_x, er_y, (unsigned char)(VT_SLOT0 - 256 + sl * 12));
+    }
+    }
+    /* the level-16 rope, until it is shot */
+    if (rope_ent && !rope_ent->state) {
+        ent_rel(rope_ent);
+        DRAW_MS(er_x, er_y, (unsigned char)(VT_ROPE - 256), 2, 2);
     }
     /* keen's zap */
     if (b_active) {
         int sx = b_px - (int)cam_x, sy = b_py - (int)cam_y;
         unsigned char base = (unsigned char)(VT_BULLET - 256)
                            + ((b_hit ? (1 + (rng & 1)) : 0) << 2);
-        SMS_addSpriteClipping(sx,     sy,     base);
-        SMS_addSpriteClipping(sx + 8, sy,     base + 1);
-        SMS_addSpriteClipping(sx,     sy + 8, base + 2);
-        SMS_addSpriteClipping(sx + 8, sy + 8, base + 3);
+        DRAW_MS(sx, sy, base, 2, 2);
     }
     /* projectiles */
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < N_PROJ; i++) {
         int sx, sy;
         if (!pj_on[i]) continue;
         sx = pj_x[i] - (int)cam_x; sy = pj_y[i] - (int)cam_y;
-        if (pj_on[i] == 1) {                      /* ice chunk 16x16 */
-            SMS_addSpriteClipping(sx,     sy,     (unsigned char)(VT_CHUNK - 256));
-            SMS_addSpriteClipping(sx + 8, sy,     (unsigned char)(VT_CHUNK - 256 + 1));
-            SMS_addSpriteClipping(sx,     sy + 8, (unsigned char)(VT_CHUNK - 256 + 2));
-            SMS_addSpriteClipping(sx + 8, sy + 8, (unsigned char)(VT_CHUNK - 256 + 3));
-        } else {                                   /* enemy ray 16x8 */
-            SMS_addSpriteClipping(sx,     sy, (unsigned char)(VT_ERAY - 256));
-            SMS_addSpriteClipping(sx + 8, sy, (unsigned char)(VT_ERAY - 256 + 1));
+        if (pj_on[i] == PJ_CHUNK) {                /* ice chunk 16x16 */
+            DRAW_MS(sx, sy, (unsigned char)(VT_CHUNK - 256), 2, 2);
+        } else if (pj_on[i] == PJ_RAY) {           /* enemy ray 16x8 */
+            DRAW_MS(sx, sy, (unsigned char)(VT_ERAY - 256), 2, 1);
+        } else {                                   /* zap / zot (16x16 art, ray at +4) */
+            DRAW_MS(sx, sy - 4, (unsigned char)(VT_BULLET - 256) + ((1 + (pj_t[i] & 1)) << 2), 2, 2);
         }
+    }
+    /* ice splinters, 8x8 */
+    for (i = 0; i < N_BITS; i++)
+        if (bit_t[i])
+            DRAW_MS(bit_x[i] - (int)cam_x, bit_y[i] - (int)cam_y,
+                    (unsigned char)(VT_ICEBIT - 256), 1, 1);
+}
+
+/* one tick of game logic (CG runs these in this order) */
+static void level_tick(unsigned int ks, unsigned int kp) {
+    player_update(ks, kp);
+    ai_run();
+    anim_scan();
+    sfx_update();
+}
+
+/* Keen's frame with the part inside the doorway cut away (CG walkbehindexitdoor:
+   everything right of exitXpos-1 is hidden, to the pixel) */
+static void keen_clip_prepare(void) {
+    unsigned char c, r, y, m;
+    int v;
+    map2(BANK_SPRITES);
+    memcpy(kbuf, spr_keen + (unsigned int)pframe * 192, 192);
+    for (c = 0; c < 2; c++) {
+        v = (int)exit_cut - (px + 8 * c);
+        if (v >= 8) continue;
+        m = (v <= 0) ? 0 : (unsigned char)(0xFF << (8 - v));
+        for (r = 0; r < 3; r++) {
+            unsigned char *t = kbuf + (r * 2 + c) * 32;
+            for (y = 0; y < 32; y++) t[y] &= m;
+        }
+    }
+    map2(ld->map_bank);
+}
+
+/* white flash of the colour RAM (a vorticon's death), fading over 4 steps */
+static unsigned char flash_lvl;
+static void flash_apply(void) {
+    unsigned char k = flash_t >> 2, i;
+    if (k == flash_lvl) return;
+    flash_lvl = k;
+    for (i = 0; i < 16; i++) {
+        unsigned char c = bg_palette[i], d = spr_palette[i];
+        unsigned char r = c & 3, g = (c >> 2) & 3, b = c >> 4;
+        unsigned char r2 = d & 3, g2 = (d >> 2) & 3, b2 = d >> 4;
+        if (r < k) r = k;
+        if (g < k) g = k;
+        if (b < k) b = k;
+        if (r2 < k) r2 = k;
+        if (g2 < k) g2 = k;
+        if (b2 < k) b2 = k;
+        SMS_setBGPaletteColor(i, r | (g << 2) | (b << 4));
+        SMS_setSpritePaletteColor(i, r2 | (g2 << 2) | (b2 << 4));
     }
 }
 
@@ -1774,9 +2088,11 @@ static void run_level(void) {
     unsigned int ks, kp;
 
     load_level(cur_level);
+    flash_lvl = 0; pal_ct = 0;
     prev_ks = SMS_getKeysStatus();       /* suppress buttons held on entry */
     jump_buf = 0;
 
+    if (!perf_on) perf_on = 1;
     while (game_state == STATE_LEVEL) {
         SMS_waitForVBlank();
 
@@ -1791,7 +2107,7 @@ static void run_level(void) {
            invisible at both edges. Blits are plain paced writes, so even
            an extreme spill cannot corrupt anything. --- */
         UNSAFE_SMS_copySpritestoSAT();
-        SMS_setBGScrollX((unsigned char)(0 - cam_x));
+        SMS_setBGScrollX((unsigned char)(0 - cam_x + (shake_t & 1)));
         SMS_setBGScrollY(scroll_y);
 
         map2(BANK_SPRITES);
@@ -1799,18 +2115,19 @@ static void run_level(void) {
             upload_slot = 0xFF;   /* diagonal-crossing frame: both strips
                                      blit this vblank, defer art streaming
                                      (build_sprites re-requests it) */
-        else if (pframe != cur_pframe) {
-            UNSAFE_SMS_loadNTiles(spr_keen + (unsigned int)pframe * 192, VT_PLAYER, 6);
+        else if (pframe != cur_pframe || (exiting && exit_cut)) {
+            UNSAFE_SMS_loadNTiles((exiting && exit_cut) ? (const unsigned char *)kbuf
+                                  : spr_keen + (unsigned int)pframe * 192, VT_PLAYER, 6);
             cur_pframe = pframe;
             upload_slot = 0xFF;   /* one 192B burst per frame */
         }
         else if (upload_slot == 0xFF && ab_n) anim_upload();
         if (upload_slot != 0xFF) {
-            unsigned char ut = upload_frame >> 4;
+            unsigned char ut = upload_frame >> 5;
             if (ET_BIG(ut)) {
-                map2(BANK_SPR2);
+                map2(ut == ET_VORT ? BANK_SPR3 : BANK_SPR2);
                 UNSAFE_SMS_loadNTiles(ent_art_ptr(ut)
-                                        + (unsigned int)(upload_frame & 15) * 384
+                                        + (unsigned int)(upload_frame & 31) * 384
                                         + (unsigned int)upload_part * 192,
                                       VT_SLOT0 + upload_slot * 12 + upload_part * 6, 6);
                 if (upload_part == 0) {
@@ -1821,7 +2138,7 @@ static void run_level(void) {
                 }
             } else {
                 UNSAFE_SMS_loadNTiles(ent_art_ptr(ut)
-                                        + (unsigned int)(upload_frame & 15) * 192,
+                                        + (unsigned int)(upload_frame & 31) * 192,
                                       VT_SLOT0 + upload_slot * 12, 6);
                 slot_vframe[upload_slot] = upload_frame;
             }
@@ -1830,36 +2147,28 @@ static void run_level(void) {
         map2(ld->map_bank);
         if (col_ready) { blit_col(); col_ready = 0; }
         if (row_ready) { blit_row(); row_ready = 0; }
+        if (flash_t || flash_lvl) flash_apply();
 
         if (SMS_queryPauseRequested()) { SMS_resetPauseRequest(); show_status_box(); }
         ks = SMS_getKeysStatus();
         kp = ks & ~prev_ks;
         prev_ks = ks;
 
-        player_update(ks, kp);
-        bullet_update();
-        proj_update();
-        {
-            unsigned char k;
-            frame_ct++;
-            cam_pg = (unsigned char)(((unsigned int)cam_x) >> 8);
-            if (cam_pg != near_pg || ++near_timer >= 8) {
-                near_pg = cam_pg; near_timer = 0;
-                rebuild_near();
-            }
-            for (k = 0; k < n_near; k++) ent_update(near_list[k]);
-            anim_scan();
-        }
-        sfx_update();
+        level_tick(ks, kp);
+        /* a 50 Hz console gets a sixth logic tick every fifth frame so the
+           game keeps its 60 Hz pace (the CPU budget per tick is unchanged) */
+        if (pal_mode && ++pal_ct >= 5) { pal_ct = 0; level_tick(ks, 0); }
 
         if (!dying)
-            camera_follow(px + 8 - 124, py + 12 - 92);
+            camera_track(px + 8 - 124, py + 12 - 92);
         /* bake queued strips into RAM now; next VBlank just blits them */
         if (pend_col != 0xFFFF) { render_col(pend_col); pend_col = 0xFFFF; }
         if (pend_row != 0xFFFF) { render_row(pend_row); pend_row = 0xFFFF; }
 
         build_sprites_level();
+        if (exiting && exit_cut) keen_clip_prepare();
     }
+    if (perf_on == 1) perf_on = 0;
     psg_tone_off(); psg_noise_off();
 }
 
@@ -1877,10 +2186,7 @@ static void build_sprites_ow(void) {
     } else f = stand_f[ow_dir];
     pframe = f;
     SMS_initSprites();
-    SMS_addSpriteClipping(sx,     sy,     (unsigned char)(VT_OWKEEN - 256));
-    SMS_addSpriteClipping(sx + 8, sy,     (unsigned char)(VT_OWKEEN - 256 + 1));
-    SMS_addSpriteClipping(sx,     sy + 8, (unsigned char)(VT_OWKEEN - 256 + 2));
-    SMS_addSpriteClipping(sx + 8, sy + 8, (unsigned char)(VT_OWKEEN - 256 + 3));
+    DRAW_MS(sx, sy, (unsigned char)(VT_OWKEEN - 256), 2, 2);
 }
 
 /* map pause menu: Status / Save Game.  Returns 1 when the screen was
@@ -2038,7 +2344,7 @@ static void run_overworld(void) {
         }
 
         sfx_update();
-        camera_follow(px + 8 - 124, py + 8 - 92);
+        camera_track(px + 8 - 124, py + 8 - 92);
         if (pend_col != 0xFFFF) { render_col(pend_col); pend_col = 0xFFFF; }
         if (pend_row != 0xFFFF) { render_row(pend_row); pend_row = 0xFFFF; }
         frame_ct++;
@@ -2165,7 +2471,7 @@ static void run_shipfly(const ShipCmd *sc, int sx, int sy, int camx, int camy) {
         }
         if (t) t--; else { ci++; t = sc[ci].t; }
         sfx_update();
-        if (scroll_on) camera_follow(px + 8 - 124, py + 4 - 92);
+        if (scroll_on) camera_track(px + 8 - 124, py + 4 - 92);
         if (pend_col != 0xFFFF) { render_col(pend_col); pend_col = 0xFFFF; }
         if (pend_row != 0xFFFF) { render_row(pend_row); pend_row = 0xFFFF; }
 
@@ -2220,6 +2526,21 @@ static void run_title(void) {
 }
 
 /* ------------------------------------------------------------------- main -- */
+/* 50 or 60 Hz console? The VDP's V counter skips backwards at the end of the
+   active picture: from 0xDA on a 262-line (NTSC) frame, from 0xF2 on a
+   313-line (PAL) one. Sample it until it jumps. */
+__sfr __at 0x7E VCounter;
+static unsigned char detect_pal(void) {
+    unsigned int guard = 12000;
+    unsigned char prev = VCounter, cur;
+    while (--guard) {
+        cur = VCounter;
+        if (cur < prev && prev < 0xFF) return prev >= 0xE0;
+        prev = cur;
+    }
+    return 0;
+}
+
 void main(void) {
     PSGPort = 0x9F; PSGPort = 0xBF; PSGPort = 0xDF; PSGPort = 0xFF;
     SMS_setSpriteMode(SPRITEMODE_NORMAL);
@@ -2228,6 +2549,8 @@ void main(void) {
     SMS_loadBGPalette(bg_palette);
     SMS_loadSpritePalette(spr_palette);
     SMS_setBackdropColor(0);
+    SMS_setFrameInterruptHandler(perf_isr);
+    pal_mode = detect_pal();                      /* 50 Hz: run 6 logic ticks per 5 frames */
 
     game_state = STATE_TITLE;
     for (;;) {
@@ -2245,4 +2568,4 @@ SMS_EMBED_SEGA_ROM_HEADER(9999, 0);
 SMS_EMBED_SDSC_HEADER_AUTO_DATE(1, 0,
     "keen-sms",
     "Commander Keen SMS",
-    "Port of HTML5-Keen (melonJS) to the Sega Master System via devkitSMS");
+    "Port of Commander Keen 1: Invasion of the Vorticons to the Sega Master System");

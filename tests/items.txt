@@ -1,0 +1,15 @@
+symbols keen.noi
+run 420
+tap 1
+run 200
+poke cur_level 1 w1
+poke game_state 2 w1
+run 90
+poke px 104 s16
+poke py 112 s16
+run 30
+expect score_lo == 100 w2
+poke px 784 s16
+poke py 152 s16
+run 30
+expect inv_ammo >= 5 w1

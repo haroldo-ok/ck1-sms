@@ -6,10 +6,8 @@ ship), every 8x8 font/icon tile, the front-end screens (title, logos,
 high-score, preview, finale), the text pages, strings and PC-speaker
 sounds.  Nothing is hand-drawn.
 
-Known simplifications (see README): enemy AI is a simplified port of the
-original's behaviour (CG-style physics, not a state-for-state copy); the
-ice cannon chunk stuns Keen instead of the frozen-in-ice-cube animation;
-the L16 chandelier rope is inert.
+Enemy AI, ice cannons and the L16 rope follow Commander Genius state for
+state; every enemy animation frame is cut from EGASPRIT.
 """
 import os, sys, struct
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -295,7 +293,7 @@ def build(idx):
     # items sorted by column so the engine can scan just a small mx window
     items.sort(key=lambda it: (it[0], it[1]))
 
-    # ---- enemies (codes 1..9); 10=rope and >10 special data are inert
+    # ---- enemies (codes 1..9), the L16 rope (10)
     ents = []
     if idx:
         for i, o in enumerate(lv['objs']):
@@ -303,6 +301,8 @@ def build(idx):
                 ents.append((o - 1, i % W, i // W))          # yorp..tank
             elif 6 <= o <= 9:
                 ents.append((o - 1, i % W, i // W))          # cannons 5..8
+            elif o == 10 and src == 16:
+                ents.append((9, i % W, i // W))              # the L16 rope
     sx, sy = lv['spawn'] or (2, 2)
     print('L%02d: %3dx%-3d mt=%3d sub=%3d items=%3d doors=%d ents=%2d exits=%d'
           % (src, W, H, len(mts), len(subs), len(items), len(doors),
@@ -388,23 +388,25 @@ def ega_frame(si, w=16, h=24):
                 g[y][x] = px[sy][sx2]
     return g
 
-GARG_F   = [60, 64, 65, 66, 67, 68, 69]      # stand, wR x2, wL x2, dying, dead
-VORT_F   = [74, 75, 70, 71, 80, 81, 85, 87]  # wR x2, wL x2, jump R/L, dying, dead
-BUTLER_F = [88, 89, 92, 93]                  # walkR x2, walkL x2 (16x16)
-TANK_F   = [98, 99, 102, 103]                # walkR x2, walkL x2
+GARG_F   = list(range(60, 70))               # look x4, walk R x2, walk L x2, dying, dead
+VORT_F   = list(range(70, 88))               # walk L x4, R x4, look x2, jump R/L, dying x6
+BUTLER_F = list(range(88, 98))               # walk R x4, L x4, turn L/R (16x16)
+TANK_F   = list(range(98, 108))              # walk R x4, L x4, look x2
 garg_frames   = [ega_frame(i, 24, 32) for i in GARG_F]
 vort_frames   = [ega_frame(i, 24, 32) for i in VORT_F]
 butler_frames = [ega_frame(i) for i in BUTLER_F]
 tank_frames   = [ega_frame(i) for i in TANK_F]
 eray_frame    = ega_frame(109, 16, 8)        # green enemy zap
 chunk_frame   = ega_frame(112, 16, 16)       # the flying ice cube
+bit_frame     = ega_frame(113, 8, 8)         # a splinter of ice
+rope_frame    = ega_frame(114, 16, 16)       # L16 rope
 # ending: the ship (right / left, 16x8) and the ? / ! marks (8x16)
 ship_frames = [ega_frame(115, 16, 8), ega_frame(116, 16, 8),
                ega_frame(118, 8, 16), ega_frame(117, 8, 16)]
 
 yorp_frames   = [ega_frame(i) for i in YORP_F]
 allspr = [g for g in KEEN_FR] + OWK_FR + BLT_FR + yorp_frames + garg_frames + vort_frames + \
-         butler_frames + tank_frames + [eray_frame, chunk_frame] + ship_frames
+         butler_frames + tank_frames + [eray_frame, chunk_frame, bit_frame, rope_frame] + ship_frames
 ega2slot, SPR_PAL = build_sprite_palette(allspr)
 
 spr_keen = b''.join(sprite_frame_tiles(g, 0, 0, 2, 3, ega2slot) for g in KEEN_FR)
@@ -425,7 +427,9 @@ spr_butler = frames_blob([  # pad 16x16 to 16x24 bottom-anchored
     [[-1]*16 for _ in range(8)] + g for g in butler_frames])
 spr_tank   = frames_blob(tank_frames)        # 4 x 6
 spr_eray   = sprite_frame_tiles(eray_frame, 0, 0, 2, 1, ega2slot)
-spr_chunk  = sprite_frame_tiles(chunk_frame, 0, 0, 2, 2, ega2slot)
+spr_chunk  = (sprite_frame_tiles(chunk_frame, 0, 0, 2, 2, ega2slot) +
+              sprite_frame_tiles(bit_frame, 0, 0, 1, 1, ega2slot) +
+              sprite_frame_tiles(rope_frame, 0, 0, 2, 2, ega2slot))   # 4 + 1 + 4 tiles
 spr_ship   = (sprite_frame_tiles(ship_frames[0], 0, 0, 2, 1, ega2slot) +
               sprite_frame_tiles(ship_frames[1], 0, 0, 2, 1, ega2slot) +
               sprite_frame_tiles(ship_frames[2], 0, 0, 1, 2, ega2slot) +
@@ -476,7 +480,8 @@ with open(os.path.join(GEN,'bank3.c'), 'w') as f:
         for fr in range(4):
             _art[aid*128 + fr*32: aid*128 + fr*32 + 32] = tile_planar([list(r) for r in _quad(b_ + fr % n_, qd >> 1, qd & 1)])
     carr(f, 'anim_art', bytes(_art))
-    carr(f, 'spr_garg', spr_garg);   carr(f, 'spr_vort', spr_vort)
+    carr(f, 'spr_garg', spr_garg)
+
 
 for b in sorted(banks):
     with open(os.path.join(GEN,'bank%d.c' % b), 'w') as f:
@@ -619,6 +624,12 @@ FE_BANKS, FE_HDR, FE_DATA, FE_LIST = ck1front.build(
     CK, hdr, EXE, T8, TILES, BANK_TXT + 1, BANK_CAP, tg)
 OVLS = ['front']          # code overlays: src/ovl_<name>.c, one bank each
 OVL_BANK = {n: BANK_TXT + 1 + len(FE_LIST) + i for i, n in enumerate(OVLS)}
+AI_BANK = max(OVL_BANK.values()) + 1      # enemy/projectile/rope code (src/main.c, #pragma codeseg BANK25)
+SPR3_BANK = AI_BANK + 1
+with open(os.path.join(GEN,'bank%d.c' % SPR3_BANK), 'w') as f:
+    f.write('/* generated: vorticon sprite sheet (bank 3 is full) */\n')
+    carr(f, 'spr_vort', spr_vort)
+assert AI_BANK == 25, 'update the codeseg pragma in main.c'
 for b, src in FE_BANKS.items():
     with open(os.path.join(GEN, 'bank%d.c' % b), 'w') as f: f.write(src)
 
@@ -670,7 +681,12 @@ with open(os.path.join(GEN,'game_data.h'), 'w') as f:
         f.write('extern const unsigned int %s_mtdef[];\n' % p)
     f.write(FE_HDR)
     for n in OVLS: f.write('#define BANK_OVL_%s %d\n' % (n.upper(), OVL_BANK[n]))
+    f.write('#define BANK_AI %d\n#define BANK_SPR3 %d\n' % (AI_BANK, SPR3_BANK))
     f.write('#endif\n')
+
+# the font lives in the text bank (fixed ROM is full): its own object, compiled with --constseg
+with open(os.path.join(GEN,'font_data.c'), 'w') as f:
+    carr(f, 'font_1bpp', bytes(font_1bpp))
 
 with open(os.path.join(GEN,'game_data.c'), 'w') as f:
     f.write('#include "game_data.h"\n')
@@ -681,7 +697,6 @@ with open(os.path.join(GEN,'game_data.c'), 'w') as f:
             % (len(snd_pri), ','.join(str(x) for x in snd_pri)))
     carr(f, 'bg_palette', bytes(BG_PAL))
     carr(f, 'spr_palette', bytes(SPR_PAL))
-    carr(f, 'font_1bpp', bytes(font_1bpp))
     f.write('const LevelDesc level_descs[18] = {\n')
     for i in range(18):
         lv, p = levels[i], 'lvl%d' % i
@@ -699,13 +714,15 @@ with open(os.path.join(GEN,'game_data.c'), 'w') as f:
 
 with open(os.path.join(GEN,'banks.mk'), 'w') as f:
     dbl = [2, 3] + sorted(banks) + [BANK_SND, BANK_TXT] + FE_LIST
-    bl = dbl + [OVL_BANK[n] for n in OVLS]
+    bl = dbl + [OVL_BANK[n] for n in OVLS] + [AI_BANK, SPR3_BANK]
     f.write('BANKS := %s\n' % ' '.join(str(b) for b in bl))
+    f.write('TXTBANK := %d\n' % BANK_TXT)
     f.write('OVLS := %s\n' % ' '.join(OVLS))
     for n in OVLS: f.write('OVL_%s := %d\n' % (n, OVL_BANK[n]))
     f.write('BANKRELS := %s\n' % ' '.join(
-        ['build/bank%d.rel' % b for b in dbl] + ['build/ovl_%s.rel' % n for n in OVLS]))
-    f.write('DATABANKS := %s\n' % ' '.join(str(b) for b in dbl))
+        ['build/bank%d.rel' % b for b in dbl] + ['build/ovl_%s.rel' % n for n in OVLS]
+        + ['build/ai.rel', 'build/bank%d.rel' % SPR3_BANK]))   # link order == physical bank order
+    f.write('DATABANKS := %s\n' % ' '.join(str(b) for b in dbl + [SPR3_BANK]))
     f.write('BANKFLAGS := %s\n' %
             ' '.join('-Wl-b_BANK%d=0x%X' % (b, (b<<16)|0x8000) for b in bl))
 

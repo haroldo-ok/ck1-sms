@@ -1,0 +1,19 @@
+# an ice chunk freezes Keen: the cube is drawn, he slides, then thaws
+symbols keen.noi
+run 420
+tap 1
+run 200
+poke cur_level 16 w1
+poke game_state 2 w1
+run 90
+poke px 120 s16
+poke py 1028 s16
+run 100
+poke stun_t 250 w2
+poke vx 480 s16
+run 20
+expect stun_t >= 200 w2
+expect dying == 0 w1
+screenshot shots/freeze.ppm
+run 60
+expect stun_t < 230 w2

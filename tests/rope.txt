@@ -1,0 +1,25 @@
+# level 16: shooting the chandelier rope drops the stone four rows
+symbols keen.noi
+run 420
+tap 1
+run 200
+poke cur_level 16 w1
+poke game_state 2 w1
+run 90
+poke inv_ammo 9 w1
+poke px 1490 s16
+poke py 136 s16
+run 300
+expect ents+14 == 0 w1
+hold right
+run 6
+hold none
+tap 2
+run 26
+expect ents+14 == 1 w1
+expect rope_sy >= 11 w1
+screenshot shots/rope_fall.ppm
+run 60
+expect ents+14 == 2 w1
+expect rope_sy == 14 w1
+expect dying == 0 w1

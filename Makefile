@@ -16,8 +16,11 @@ PROG     := keen
 
 include gen/banks.mk
 
-CFLAGS   := -mz80 --peep-file $(SMSLIB)/peep-rules.txt -I$(SMSLIB) -Igen
-LDFLAGS  := -mz80 --no-std-crt0 --data-loc 0xC000 $(BANKFLAGS)
+# release builds let SDCC search register allocations much harder (several
+# minutes for main.c, ~10% faster code); `make OPT=` for quick dev builds
+OPT      ?= --max-allocs-per-node 100000
+CFLAGS   := -mz80 $(OPT) --peep-file $(SMSLIB)/peep-rules.txt -I$(SMSLIB) -Igen
+LDFLAGS  := -mz80 -Wl-u --no-std-crt0 --data-loc 0xC000 $(BANKFLAGS)
 
 all: $(PROG).sms
 
@@ -41,8 +44,17 @@ build/ovl_%.rel: src/ovl_%.c src/engine.h gen/game_data.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) --codeseg BANK$(OVL_$*) --constseg BANK$(OVL_$*) -c $< -o $@
 
-$(PROG).ihx: build/main.rel build/game_data.rel $(BANKRELS)
-	$(CC) -o $@ $(LDFLAGS) $(CRT0) build/main.rel build/game_data.rel $(SMSLIB)/SMSlib.lib $(BANKRELS)
+build/ai.rel: src/ai.c src/shared.h gen/game_data.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) --codeseg BANK25 -c $< -o $@
+
+build/font_data.rel: gen/font_data.c
+	@mkdir -p build
+	$(CC) -mz80 --constseg BANK$(TXTBANK) -c $< -o $@
+
+$(PROG).ihx: build/main.rel build/game_data.rel build/font_data.rel $(BANKRELS)
+	@touch crt0_sms.lst   # -Wl-u (relocated listings for perf/) wants one per object
+	$(CC) -o $@ $(LDFLAGS) $(CRT0) build/main.rel build/game_data.rel $(SMSLIB)/SMSlib.lib $(BANKRELS) build/font_data.rel
 
 $(PROG).sms: $(PROG).ihx
 	$(IHX2SMS) $< $@

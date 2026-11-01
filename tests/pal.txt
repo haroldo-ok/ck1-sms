@@ -1,0 +1,13 @@
+# 50 Hz consoles run six logic ticks per five frames
+symbols keen.noi
+run 420
+tap 1
+run 200
+poke cur_level 2 w1
+poke game_state 2 w1
+run 60
+poke pal_mode 1 w1
+poke perf_loops 0 w2
+run 100
+expect perf_loops >= 118 w2
+expect perf_loops <= 122 w2
